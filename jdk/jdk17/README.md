@@ -139,3 +139,9 @@ return strerror_r(err, buf, len);
 
 `build.sh` 会把 `jni_util_md.c` 的 `getErrorString` 改成 Android 分支（GNU → 填 buf，返回 0）。
 
+### `iconv_open` undeclared (API &lt; 28)
+
+Bionic 的 `iconv_*` 也从 **API 28** 才声明。主补丁用 `libtinyiconv` 提供实现，并链入 `libinstrument` / `libjdwp`，但系统 `<iconv.h>` 在 API 24 下无原型。
+
+`build.sh` 会安装 `libtinyiconv/iconv.h`，并把 `java.base:libtinyiconv` 加进相关模块的 `EXTRA_HEADER_DIRS`。
+

@@ -341,6 +341,105 @@ print("rewrote", p)
       || die "Failed to apply Android strerror_r fix to jni_util_md.c"
   fi
 
+  # Bionic iconv_* only from API 28. Main patch adds libtinyiconv + EXTRA_SRC
+  # into libinstrument/libjdwp, but system <iconv.h> has no prototypes under
+  # minSdk < 28. Install a local iconv.h and point EXTRA_HEADER_DIRS at it.
+  local tiny_dir="src/java.base/share/native/libtinyiconv"
+  local tiny_iconv_h="$tiny_dir/iconv.h"
+  local compat_iconv_h="$ROOT/compat/iconv.h"
+  if [[ -f "$tiny_dir/iconv.cpp" ]]; then
+    log "Installing tinyiconv iconv.h for API < 28 prototypes"
+    if [[ -f "$compat_iconv_h" ]]; then
+      cp -f "$compat_iconv_h" "$tiny_iconv_h"
+    else
+      cat > "$tiny_iconv_h" <<'HDR'
+#ifndef ANDROID_OPENJDK_TINY_ICONV_H
+#define ANDROID_OPENJDK_TINY_ICONV_H
+#include <stddef.h>
+#include <sys/cdefs.h>
+__BEGIN_DECLS
+struct __iconv_t;
+typedef struct __iconv_t *iconv_t;
+iconv_t iconv_open(const char *dst_encoding, const char *src_encoding);
+size_t iconv(iconv_t converter,
+             char **src_buf, size_t *src_bytes_left,
+             char **dst_buf, size_t *dst_bytes_left);
+int iconv_close(iconv_t converter);
+__END_DECLS
+#endif
+HDR
+    fi
+    # Ensure iconv.cpp uses the local header (angle brackets still work with -I)
+    if grep -q '#include <iconv.h>' "$tiny_dir/iconv.cpp"; then
+      sed -i 's|#include <iconv.h>|#include "iconv.h"|' "$tiny_dir/iconv.cpp"
+    fi
+    # Add EXTRA_HEADER_DIRS java.base:libtinyiconv to instrument + jdwp Lib.gmk
+    python3 - <<'PY2'
+from pathlib import Path
+import re
+
+def ensure_tinyiconv_header(t: str) -> str:
+    """Ensure EXTRA_HEADER_DIRS includes java.base:libtinyiconv."""
+    # Single-line: EXTRA_HEADER_DIRS := java.base:libjli,
+    m = re.search(r"^([ \t]*EXTRA_HEADER_DIRS\s*:=\s*)([^\\\n]+)$", t, re.M)
+    if m:
+        line = m.group(0)
+        if "libtinyiconv" in line:
+            return t
+        body = m.group(2).rstrip()
+        if body.endswith(","):
+            body = body[:-1].rstrip() + " java.base:libtinyiconv,"
+        else:
+            body = body + " java.base:libtinyiconv"
+        return t[: m.start()] + m.group(1) + body + t[m.end() :]
+
+    # Multi-line: EXTRA_HEADER_DIRS := \
+    m = re.search(r"^([ \t]*EXTRA_HEADER_DIRS\s*:=\s*\\)[ \t]*\n", t, re.M)
+    if m:
+        rest = t[m.end() :]
+        block_lines = []
+        for line in rest.splitlines(keepends=True):
+            block_lines.append(line)
+            if not re.search(r"\\[ \t]*$", line.rstrip("\n")):
+                break
+        block = "".join(block_lines)
+        if "libtinyiconv" in block:
+            return t
+        insert = "      java.base:libtinyiconv \\\n"
+        return t[: m.end()] + insert + t[m.end() :]
+
+    # No EXTRA_HEADER_DIRS: add after EXTRA_SRC tinyiconv line
+    if "EXTRA_SRC := java.base:libtinyiconv," in t:
+        return t.replace(
+            "EXTRA_SRC := java.base:libtinyiconv,",
+            "EXTRA_SRC := java.base:libtinyiconv,\n"
+            "    EXTRA_HEADER_DIRS := java.base:libtinyiconv,",
+            1,
+        )
+    raise SystemExit("Could not locate EXTRA_HEADER_DIRS to inject libtinyiconv")
+
+
+for rel in (
+    "make/modules/java.instrument/Lib.gmk",
+    "make/modules/jdk.jdwp.agent/Lib.gmk",
+):
+    path = Path(rel)
+    if not path.exists():
+        print("skip missing", rel)
+        continue
+    t = path.read_text()
+    t2 = ensure_tinyiconv_header(t)
+    path.write_text(t2)
+    print("patched", rel)
+    for i, line in enumerate(t2.splitlines(), 1):
+        if "HEADER" in line or "tinyiconv" in line or "EXTRA_SRC" in line:
+            print(f"  {i}: {line}")
+PY2
+    [[ -f "$tiny_iconv_h" ]] || die "Failed to install $tiny_iconv_h"
+  elif [[ ! -f "$tiny_dir/iconv.cpp" ]]; then
+    log "WARNING: libtinyiconv/iconv.cpp missing after Android patch"
+  fi
+
   # Host X11 / fontconfig / alsa headers for configure probes
   # (headless still needs includes; target clang uses sysroot, so point explicitly)
   local android_include="$SYSROOT/usr/include"
