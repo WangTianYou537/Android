@@ -128,3 +128,14 @@ error: call to undeclared function 'posix_spawn'
 
 处理：主补丁提供 `libjava/posix_spawn.{c,h}`（dhcpcd 兼容实现），`build.sh` 会把 `ProcessImpl_md.c` 的 `#include <spawn.h>` 改成 `#include "posix_spawn.h"`。
 
+### `strerror_r` pointer/int mismatch (Bionic GNU)
+
+NDK clang 默认 `__USE_GNU`，Bionic 的 `strerror_r` 返回 `char*`，而 OpenJDK 期望 XSI 版返回 `int`：
+
+```
+error: incompatible pointer to integer conversion returning 'char *' ...
+return strerror_r(err, buf, len);
+```
+
+`build.sh` 会把 `jni_util_md.c` 的 `getErrorString` 改成 Android 分支（GNU → 填 buf，返回 0）。
+

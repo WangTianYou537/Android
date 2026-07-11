@@ -1,0 +1,28 @@
+--- a/src/java.base/unix/native/libjava/jni_util_md.c
++++ b/src/java.base/unix/native/libjava/jni_util_md.c
+@@ -72,5 +72,25 @@
+ getErrorString(int err, char *buf, size_t len)
+ {
+     if (err == 0 || len < 1) return 0;
++#if defined(__ANDROID__)
++    /*
++     * Bionic: with __USE_GNU (default for NDK clang) strerror_r is the GNU
++     * form returning char*. OpenJDK expects the XSI form returning int.
++     * The main Android patch only skips __xpg_strerror_r; handle the body here.
++     */
++    {
++        char *msg = strerror_r(err, buf, len);
++        if (msg != NULL && msg != buf) {
++            size_t n = strlen(msg);
++            if (n >= len) {
++                n = len - 1;
++            }
++            memmove(buf, msg, n);
++            buf[n] = '\0';
++        }
++        return 0;
++    }
++#else
+     return strerror_r(err, buf, len);
++#endif
+ }

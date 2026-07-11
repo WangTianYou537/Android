@@ -291,6 +291,56 @@ build_jdk() {
       || die "Failed to retarget ProcessImpl_md.c to posix_spawn.h"
   fi
 
+  # Bionic GNU strerror_r returns char*; OpenJDK expects XSI int return.
+  local jni_util="src/java.base/unix/native/libjava/jni_util_md.c"
+  local jni_patch="$ROOT/patches/jni_util_md_strerror_r_android.diff"
+  if [[ -f "$jni_util" ]] && ! grep -q 'Bionic: with __USE_GNU' "$jni_util"; then
+    log "Fixing jni_util_md.c strerror_r for Bionic (GNU vs XSI)"
+    if [[ ! -f "$jni_patch" ]] || ! patch -p1 < "$jni_patch" >>"$BUILD_ROOT/patch-$ABI.log" 2>&1; then
+      log "patch failed; applying strerror_r fix via sed/python fallback"
+      python3 -c '
+import re, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+new = """JNIEXPORT int JNICALL
+getErrorString(int err, char *buf, size_t len)
+{
+    if (err == 0 || len < 1) return 0;
+#if defined(__ANDROID__)
+    /* Bionic: with __USE_GNU (default for NDK clang) strerror_r is the GNU
+     * form returning char*. OpenJDK expects the XSI form returning int. */
+    {
+        char *msg = strerror_r(err, buf, len);
+        if (msg != NULL && msg != buf) {
+            size_t n = strlen(msg);
+            if (n >= len) {
+                n = len - 1;
+            }
+            memmove(buf, msg, n);
+            buf[n] = \"\\0\";
+        }
+        return 0;
+    }
+#else
+    return strerror_r(err, buf, len);
+#endif
+}
+"""
+pat = re.compile(
+    r"JNIEXPORT int JNICALL\s+getErrorString\(int err, char \*buf, size_t len\)\s*\{.*?\n\}",
+    re.S,
+)
+t2, n = pat.subn(new.strip() + "\n", t, count=1)
+if n != 1:
+    sys.exit("getErrorString not found")
+p.write_text(t2)
+print("rewrote", p)
+' "$jni_util" || die "Failed strerror_r fallback rewrite"
+    fi
+    grep -q '__ANDROID__' "$jni_util" \
+      || die "Failed to apply Android strerror_r fix to jni_util_md.c"
+  fi
+
   # Host X11 / fontconfig / alsa headers for configure probes
   # (headless still needs includes; target clang uses sysroot, so point explicitly)
   local android_include="$SYSROOT/usr/include"
