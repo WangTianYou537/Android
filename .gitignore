@@ -1,0 +1,17 @@
+# Local NDK (use CI download or /opt install)
+android-ndk-r*
+android-ndk-r*/
+android-ndk-*.zip
+*.zip
+!compat/**
+
+# Build outputs
+out/
+dist/
+.build/
+.ndk/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

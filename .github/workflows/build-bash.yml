@@ -1,0 +1,182 @@
+# Manual build of GNU bash for Android (all or selected ABIs).
+# Actions → "Build Android bash" → Run workflow → fill bash_version.
+name: Build Android bash
+
+on:
+  workflow_dispatch:
+    inputs:
+      bash_version:
+        description: "GNU bash version (e.g. 5.2.37, 5.3)"
+        required: true
+        type: string
+        default: "5.2.37"
+      api:
+        description: "Min Android API level"
+        required: true
+        type: string
+        default: "24"
+      abis:
+        description: "ABIs to build"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - arm64
+          - arm
+          - x86_64
+          - x86
+      ndk_version:
+        description: "NDK release name (matches Google zip android-ndk-<name>-linux.zip)"
+        required: true
+        type: string
+        default: "r27d"
+      create_release:
+        description: "Upload binaries as a GitHub Release (tag bash-<version>)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # needed only when create_release=true
+
+concurrency:
+  group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.abis }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: bash ${{ inputs.bash_version }} / ${{ inputs.abis }} / API ${{ inputs.api }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      BASH_VER: ${{ inputs.bash_version }}
+      API: ${{ inputs.api }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+      BUILD_ROOT: ${{ github.workspace }}/.build
+      NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
+      OUT_DIR: ${{ github.workspace }}/out
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "$BASH_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::bash_version must look like 5.2.37 or 5.3 (got: $BASH_VER)"
+            exit 1
+          fi
+          if [[ ! "$API" =~ ^[0-9]+$ ]] || (( API < 21 || API > 35 )); then
+            echo "::error::api must be an integer 21–35 (got: $API)"
+            exit 1
+          fi
+          if [[ ! "$NDK_VERSION" =~ ^r[0-9]+[a-z]?$ ]]; then
+            echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
+            exit 1
+          fi
+          echo "bash=$BASH_VER api=$API ndk=$NDK_VERSION abis=${{ inputs.abis }}"
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bison wget curl file binutils
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Download & extract NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NDK")"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          url="https://dl.google.com/android/repository/${zip}"
+          echo "Downloading $url"
+          wget -q --show-progress -O "/tmp/${zip}" "$url"
+          echo "Extracting..."
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          cat "$NDK/source.properties"
+
+      - name: Verify NDK
+        run: |
+          set -euo pipefail
+          echo "NDK=$NDK"
+          test -d "$NDK"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -2
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E "aarch64-linux-android${API}-clang$" | head -3
+
+      - name: Build bash
+        run: |
+          set -euo pipefail
+          chmod +x ./build-android-bash.sh
+          ./build-android-bash.sh "${{ inputs.abis }}"
+
+      - name: Collect artifacts
+        id: pack
+        run: |
+          set -euo pipefail
+          stage="dist/bash-${BASH_VER}-android-api${API}"
+          mkdir -p "$stage"
+          # Copy per-ABI binaries + build info
+          found=0
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            if [[ -f "out/${abi}/bash" ]]; then
+              mkdir -p "$stage/${abi}"
+              cp -a "out/${abi}/bash" "$stage/${abi}/"
+              [[ -f "out/${abi}/BUILD_INFO.txt" ]] && cp -a "out/${abi}/BUILD_INFO.txt" "$stage/${abi}/"
+              file "out/${abi}/bash" | tee -a "$stage/SUMMARY.txt"
+              ls -lh "out/${abi}/bash" | tee -a "$stage/SUMMARY.txt"
+              found=1
+            fi
+          done
+          if [[ "$found" -ne 1 ]]; then
+            echo "::error::No bash binaries produced under out/"
+            find out -type f 2>/dev/null || true
+            exit 1
+          fi
+          {
+            echo "bash ${BASH_VER}"
+            echo "API ${API}"
+            echo "NDK ${NDK_VERSION}"
+            echo "ABIs: ${{ inputs.abis }}"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
+            echo "commit: ${{ github.sha }}"
+          } | tee "$stage/RELEASE_NOTES.txt"
+          # Zip for download convenience
+          (cd dist && zip -r "bash-${BASH_VER}-android-api${API}.zip" "bash-${BASH_VER}-android-api${API}")
+          echo "artifact_name=bash-${BASH_VER}-android-api${API}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=dist/bash-${BASH_VER}-android-api${API}.zip" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.artifact_name }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bash-${{ inputs.bash_version }}-api${{ inputs.api }}
+          name: bash ${{ inputs.bash_version }} (Android API ${{ inputs.api }})
+          body_path: dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}/RELEASE_NOTES.txt
+          files: |
+            dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}.zip
+            dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}/*/bash
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
