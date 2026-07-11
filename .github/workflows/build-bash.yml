@@ -1,5 +1,6 @@
 # Manual build of GNU bash for Android (multi-select ABIs via checkboxes).
 # Actions → "Build Android bash" → Run workflow → fill bash_version + tick ABIs.
+# Release assets: one bare binary per ABI named bash-<version>-<abi> (no zip bundle).
 name: Build Android bash
 
 on:
@@ -41,7 +42,7 @@ on:
         type: string
         default: "r27d"
       create_release:
-        description: "Upload binaries as a GitHub Release (tag bash-<version>-<abi>)"
+        description: "Publish each ABI as a separate release asset (bash-<version>-<abi>)"
         required: true
         type: boolean
         default: false
@@ -85,21 +86,9 @@ jobs:
             echo "::error::Select at least one ABI checkbox (arm64 / arm / x86_64 / x86)."
             exit 1
           fi
-          # space-separated for the build script
           echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
-          # display: arm64,arm
           echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
-          # tag/artifact slug: single ABI as-is; all four -> "all"; else join with +
-          if [[ ${#selected[@]} -eq 4 ]]; then
-            slug=all
-          elif [[ ${#selected[@]} -eq 1 ]]; then
-            slug="${selected[0]}"
-          else
-            slug=$(IFS=+; echo "${selected[*]}")
-          fi
-          # GitHub artifact names / tags: keep slug filesystem-safe (+ is fine in tags)
-          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
-          echo "Selected ABIs: ${selected[*]} (slug=${slug})"
+          echo "Selected ABIs: ${selected[*]}"
 
       - name: Validate inputs
         run: |
@@ -160,68 +149,122 @@ jobs:
           # shellcheck disable=SC2086
           ./build-android-bash.sh ${{ steps.abis.outputs.list }}
 
-      - name: Collect artifacts
+      # Stage each ABI as its own bare binary: bash-<version>-<abi>
+      # Map build dirs → short names used in asset filenames.
+      - name: Stage per-ABI binaries
         id: pack
         run: |
           set -euo pipefail
-          # Naming is ABI-centric: bash-<version>-<abi-slug>
-          # Examples: bash-5.2.37-arm64  |  bash-5.2.37-arm64+arm  |  bash-5.2.37-all
-          SLUG="${{ steps.abis.outputs.slug }}"
-          BASE="bash-${BASH_VER}-${SLUG}"
-          stage="dist/${BASE}"
-          mkdir -p "$stage"
+          mkdir -p dist release-assets
           found=0
-          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-            if [[ -f "out/${abi}/bash" ]]; then
-              mkdir -p "$stage/${abi}"
-              cp -a "out/${abi}/bash" "$stage/${abi}/"
-              [[ -f "out/${abi}/BUILD_INFO.txt" ]] && cp -a "out/${abi}/BUILD_INFO.txt" "$stage/${abi}/"
-              file "out/${abi}/bash" | tee -a "$stage/SUMMARY.txt"
-              ls -lh "out/${abi}/bash" | tee -a "$stage/SUMMARY.txt"
-              found=1
+          asset_list=()
+
+          # out-dir-name → short abi slug for filename
+          declare -A MAP=(
+            [arm64-v8a]=arm64
+            [armeabi-v7a]=arm
+            [x86_64]=x86_64
+            [x86]=x86
+          )
+
+          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
+            src="out/${dir}/bash"
+            [[ -f "$src" ]] || continue
+            short="${MAP[$dir]}"
+            name="bash-${BASH_VER}-${short}"
+            dest="release-assets/${name}"
+            cp -a "$src" "$dest"
+            chmod 755 "$dest"
+            # Keep BUILD_INFO next to it for the workflow artifact (not uploaded to Release)
+            if [[ -f "out/${dir}/BUILD_INFO.txt" ]]; then
+              cp -a "out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
             fi
+            file "$dest" | tee -a dist/SUMMARY.txt
+            ls -lh "$dest" | tee -a dist/SUMMARY.txt
+            asset_list+=("$dest")
+            found=1
           done
+
           if [[ "$found" -eq 0 ]]; then
             echo "::error::No bash binaries produced under out/"
             find out -type f 2>/dev/null || true
             exit 1
           fi
+
           {
             echo "bash ${BASH_VER}"
-            echo "ABI: ${{ steps.abis.outputs.csv }} (slug: ${SLUG})"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
+            echo "assets:"
+            for a in "${asset_list[@]}"; do
+              echo "  - $(basename "$a")"
+            done
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
             echo "commit: ${{ github.sha }}"
-          } | tee "$stage/RELEASE_NOTES.txt"
-          (cd dist && zip -r "${BASE}.zip" "${BASE}")
-          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "zip_path=dist/${BASE}.zip" >> "$GITHUB_OUTPUT"
-          echo "notes_path=dist/${BASE}/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
-          ls -lh dist/
+          } | tee dist/RELEASE_NOTES.txt
 
-      - name: Upload workflow artifact
+          # newline-separated list for the release step
+          {
+            for a in "${asset_list[@]}"; do
+              echo "$a"
+            done
+          } > dist/asset-files.txt
+
+          echo "notes_path=dist/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
+          echo "asset_count=${#asset_list[@]}" >> "$GITHUB_OUTPUT"
+          echo "Staged ${#asset_list[@]} asset(s):"
+          ls -lh release-assets/
+
+      - name: Upload workflow artifacts (per-ABI binaries)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pack.outputs.artifact_name }}
-          path: dist/**
+          name: bash-${{ inputs.bash_version }}
+          path: |
+            release-assets/bash-*
+            dist/RELEASE_NOTES.txt
+            dist/SUMMARY.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create GitHub Release
+      # One Release tag per bash version; each ABI is a separate downloadable asset
+      # named bash-<version>-<abi> (bare binary, no zip).
+      - name: Create / update GitHub Release
         if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v2
-        with:
-          # e.g. bash-5.2.37-arm64  |  bash-5.2.37-arm64+arm  |  bash-5.2.37-all
-          tag_name: ${{ steps.pack.outputs.base }}
-          name: bash ${{ inputs.bash_version }} (${{ steps.abis.outputs.csv }})
-          body_path: ${{ steps.pack.outputs.notes_path }}
-          files: |
-            ${{ steps.pack.outputs.zip_path }}
-            dist/${{ steps.pack.outputs.base }}/*/bash
-          fail_on_unmatched_files: true
-          generate_release_notes: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="bash-${BASH_VER}"
+          TITLE="bash ${BASH_VER}"
+          NOTES_FILE="dist/RELEASE_NOTES.txt"
+          mapfile -t ASSETS < dist/asset-files.txt
+
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "::error::No release assets staged"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — updating notes and re-uploading assets"
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            echo "Creating release $TAG"
+            # create without assets first, then upload one-by-one
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes-file "$NOTES_FILE" \
+              --latest=false
+          fi
+
+          # Upload each ABI binary individually (clobber if re-run same version)
+          for asset in "${ASSETS[@]}"; do
+            name="$(basename "$asset")"
+            echo "==> upload $name"
+            # --clobber replaces same-named asset on re-publish
+            gh release upload "$TAG" "$asset" --clobber
+          done
+
+          echo "Release $TAG assets:"
+          gh release view "$TAG" --json assets --jq '.assets[].name'
