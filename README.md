@@ -146,7 +146,7 @@ Workflow 文件：`.github/workflows/build-bash.yml`
 | `abi_x86_64` | 勾选编译 x86_64 | ✅ true |
 | `abi_x86` | 勾选编译 x86 | ✅ true |
 | `ndk_version` | NDK 发行名，对应 Google 包名 `android-ndk-<name>-linux.zip` | `r27d` |
-| `create_release` | 是否额外打 GitHub Release（tag `bash-<ver>-api<api>`） | `false` |
+| `create_release` | 是否额外打 GitHub Release（tag `bash-<ver>-<abi>`） | `false` |
 
 > GitHub 的 `choice` 输入不支持多选，因此每个 ABI 用一个 **boolean 勾选框**，可任意组合。
 
@@ -168,10 +168,18 @@ gh workflow run build-bash.yml \
 gh workflow run build-bash.yml -f bash_version=5.2.37
 ```
 
-### 产物
+### 产物命名（以 ABI 为主）
 
-- **Artifacts**：`bash-<version>-android-api<api>.zip`（保留 30 天）
-- 若勾选 `create_release`：创建同名 tag 的 Release，内含 zip 与各 ABI 的 `bash`
+| 勾选情况 | Artifact / Release tag 示例 |
+|----------|-----------------------------|
+| 仅 arm64 | `bash-5.2.37-arm64` |
+| arm64 + arm | `bash-5.2.37-arm64+arm` |
+| 四个全选 | `bash-5.2.37-all` |
+
+- zip：`bash-<version>-<abi-slug>.zip`（内含 `arm64-v8a/bash` 等子目录）
+- Artifact 保留 30 天
+- 若勾选 `create_release`：创建**同名 tag** 的 Release（含 zip + 各 ABI 的 `bash`）
+- 最低 Android API / NDK 版本写在 `RELEASE_NOTES.txt` 里，不进主文件名
 
 NDK 在 runner 上缓存；第二次同版本 NDK 构建会跳过下载。
 

@@ -41,7 +41,7 @@ on:
         type: string
         default: "r27d"
       create_release:
-        description: "Upload binaries as a GitHub Release (tag bash-<version>-api<api>)"
+        description: "Upload binaries as a GitHub Release (tag bash-<version>-<abi>)"
         required: true
         type: boolean
         default: false
@@ -50,12 +50,12 @@ permissions:
   contents: write  # needed only when create_release=true
 
 concurrency:
-  group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.api }}
+  group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}-${{ inputs.api }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: bash ${{ inputs.bash_version }} / API ${{ inputs.api }}
+    name: bash ${{ inputs.bash_version }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -85,10 +85,21 @@ jobs:
             echo "::error::Select at least one ABI checkbox (arm64 / arm / x86_64 / x86)."
             exit 1
           fi
-          # space-separated for the build script; comma for display
+          # space-separated for the build script
           echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          # display: arm64,arm
           echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
-          echo "Selected ABIs: ${selected[*]}"
+          # tag/artifact slug: single ABI as-is; all four -> "all"; else join with +
+          if [[ ${#selected[@]} -eq 4 ]]; then
+            slug=all
+          elif [[ ${#selected[@]} -eq 1 ]]; then
+            slug="${selected[0]}"
+          else
+            slug=$(IFS=+; echo "${selected[*]}")
+          fi
+          # GitHub artifact names / tags: keep slug filesystem-safe (+ is fine in tags)
+          echo "slug=${slug}" >> "$GITHUB_OUTPUT"
+          echo "Selected ABIs: ${selected[*]} (slug=${slug})"
 
       - name: Validate inputs
         run: |
@@ -153,7 +164,11 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          stage="dist/bash-${BASH_VER}-android-api${API}"
+          # Naming is ABI-centric: bash-<version>-<abi-slug>
+          # Examples: bash-5.2.37-arm64  |  bash-5.2.37-arm64+arm  |  bash-5.2.37-all
+          SLUG="${{ steps.abis.outputs.slug }}"
+          BASE="bash-${BASH_VER}-${SLUG}"
+          stage="dist/${BASE}"
           mkdir -p "$stage"
           found=0
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
@@ -173,16 +188,18 @@ jobs:
           fi
           {
             echo "bash ${BASH_VER}"
-            echo "API ${API}"
-            echo "NDK ${NDK_VERSION}"
-            echo "ABIs: ${{ steps.abis.outputs.csv }}"
+            echo "ABI: ${{ steps.abis.outputs.csv }} (slug: ${SLUG})"
+            echo "min Android API: ${API}"
+            echo "NDK: ${NDK_VERSION}"
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
             echo "commit: ${{ github.sha }}"
           } | tee "$stage/RELEASE_NOTES.txt"
-          (cd dist && zip -r "bash-${BASH_VER}-android-api${API}.zip" "bash-${BASH_VER}-android-api${API}")
-          echo "artifact_name=bash-${BASH_VER}-android-api${API}" >> "$GITHUB_OUTPUT"
-          echo "zip_path=dist/bash-${BASH_VER}-android-api${API}.zip" >> "$GITHUB_OUTPUT"
+          (cd dist && zip -r "${BASE}.zip" "${BASE}")
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=dist/${BASE}.zip" >> "$GITHUB_OUTPUT"
+          echo "notes_path=dist/${BASE}/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
           ls -lh dist/
 
       - name: Upload workflow artifact
@@ -197,12 +214,13 @@ jobs:
         if: ${{ inputs.create_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: bash-${{ inputs.bash_version }}-api${{ inputs.api }}
-          name: bash ${{ inputs.bash_version }} (Android API ${{ inputs.api }})
-          body_path: dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}/RELEASE_NOTES.txt
+          # e.g. bash-5.2.37-arm64  |  bash-5.2.37-arm64+arm  |  bash-5.2.37-all
+          tag_name: ${{ steps.pack.outputs.base }}
+          name: bash ${{ inputs.bash_version }} (${{ steps.abis.outputs.csv }})
+          body_path: ${{ steps.pack.outputs.notes_path }}
           files: |
-            dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}.zip
-            dist/bash-${{ inputs.bash_version }}-android-api${{ inputs.api }}/*/bash
+            ${{ steps.pack.outputs.zip_path }}
+            dist/${{ steps.pack.outputs.base }}/*/bash
           fail_on_unmatched_files: true
           generate_release_notes: false
         env:
