@@ -115,3 +115,16 @@ jdk/jdk17/
 
 - OpenJDK Mobile / Android: http://openjdk.java.net/projects/mobile/android.html
 - FCL Android-OpenJDK-Build: https://github.com/FCL-Team/Android-OpenJDK-Build
+
+## 已知问题 / 修复
+
+### `posix_spawn` undeclared (API &lt; 28)
+
+Bionic 从 **API 28** 才导出 `posix_spawn`。默认 `API=24` 时，系统 `<spawn.h>` 无原型，编译 `ProcessImpl_md.c` 会失败：
+
+```
+error: call to undeclared function 'posix_spawn'
+```
+
+处理：主补丁提供 `libjava/posix_spawn.{c,h}`（dhcpcd 兼容实现），`build.sh` 会把 `ProcessImpl_md.c` 的 `#include <spawn.h>` 改成 `#include "posix_spawn.h"`。
+

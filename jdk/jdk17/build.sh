@@ -267,6 +267,30 @@ build_jdk() {
     fi
   fi
 
+  # Bionic posix_spawn is API 28+. Main patch adds libjava/posix_spawn.{c,h}
+  # but ProcessImpl_md.c still includes system <spawn.h>, which has no
+  # prototype under minSdk < 28 → -Werror-ish implicit-function-declaration.
+  local spawn_fix="src/java.base/unix/native/libjava/ProcessImpl_md.c"
+  local spawn_patch="$ROOT/patches/processimpl_posix_spawn_compat.diff"
+  if [[ -f "$spawn_fix" ]]; then
+    if grep -q '#include <spawn.h>' "$spawn_fix"; then
+      log "Pointing ProcessImpl_md.c at local posix_spawn.h (API < 28 compat)"
+      if [[ -f "$spawn_patch" ]]; then
+        patch -p1 < "$spawn_patch" >>"$BUILD_ROOT/patch-$ABI.log" 2>&1 \
+          || sed -i 's|#include <spawn.h>|#include "posix_spawn.h"|' "$spawn_fix"
+      else
+        sed -i 's|#include <spawn.h>|#include "posix_spawn.h"|' "$spawn_fix"
+      fi
+    fi
+    # Sanity: compat sources must exist (from main Android patch)
+    if [[ ! -f src/java.base/unix/native/libjava/posix_spawn.c \
+       || ! -f src/java.base/unix/native/libjava/posix_spawn.h ]]; then
+      die "Android patch did not add libjava/posix_spawn.{c,h}"
+    fi
+    grep -q 'posix_spawn.h' "$spawn_fix" \
+      || die "Failed to retarget ProcessImpl_md.c to posix_spawn.h"
+  fi
+
   # Host X11 / fontconfig / alsa headers for configure probes
   # (headless still needs includes; target clang uses sysroot, so point explicitly)
   local android_include="$SYSROOT/usr/include"

@@ -1,0 +1,15 @@
+--- a/src/java.base/unix/native/libjava/ProcessImpl_md.c
++++ b/src/java.base/unix/native/libjava/ProcessImpl_md.c
+@@ -44,7 +44,12 @@
+ #include <signal.h>
+ #include <string.h>
+ 
+-#include <spawn.h>
++/* Android Bionic only declares/exports posix_spawn from API 28+.
++ * For lower minSdk we ship a small dhcpcd-based compat in this directory
++ * (posix_spawn.c / posix_spawn.h from the Android OpenJDK patch set).
++ * Use the local header so the compiler sees a prototype on API 24 builds.
++ */
++#include "posix_spawn.h"
+ 
+ #include "childproc.h"
