@@ -1,15 +1,17 @@
-# Local NDK (use CI download or /opt install)
-android-ndk-r*
-android-ndk-r*/
-android-ndk-*.zip
+# Local NDK (shared; use CI download or /opt install)
+/android-ndk-r*
+/android-ndk-*.zip
 *.zip
-!compat/**
 
-# Build outputs
-out/
-dist/
+# Per-package build outputs
+**/out/
+**/dist/
+.release-assets/
+
+# CI / local caches
 .build/
 .ndk/
+/tmp/
 
 # Editor / OS
 .DS_Store

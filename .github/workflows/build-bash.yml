@@ -1,6 +1,6 @@
-# Manual build of GNU bash for Android (multi-select ABIs via checkboxes).
-# Actions → "Build Android bash" → Run workflow → fill bash_version + tick ABIs.
-# Release assets: one bare binary per ABI named bash-<version>-<abi> (no zip bundle).
+# Build GNU bash for Android (package: bash/)
+# Actions → "Build Android bash" → Run workflow
+# Release assets: one bare binary per ABI named bash-<version>-<abi> (no zip).
 name: Build Android bash
 
 on:
@@ -48,7 +48,7 @@ on:
         default: false
 
 permissions:
-  contents: write  # needed only when create_release=true
+  contents: write
 
 concurrency:
   group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}-${{ inputs.api }}
@@ -64,9 +64,10 @@ jobs:
       BASH_VER: ${{ inputs.bash_version }}
       API: ${{ inputs.api }}
       NDK_VERSION: ${{ inputs.ndk_version }}
-      BUILD_ROOT: ${{ github.workspace }}/.build
+      # Shared build cache root; per-package outputs under packages' own out/
+      BUILD_ROOT: ${{ github.workspace }}/.build/bash
       NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
-      OUT_DIR: ${{ github.workspace }}/out
+      OUT_DIR: ${{ github.workspace }}/bash/out
 
     steps:
       - name: Checkout
@@ -77,7 +78,6 @@ jobs:
         run: |
           set -euo pipefail
           selected=()
-          # GitHub passes boolean inputs as the strings "true" / "false"
           [[ "${{ inputs.abi_arm64 }}"  == "true" ]] && selected+=(arm64)
           [[ "${{ inputs.abi_arm }}"    == "true" ]] && selected+=(arm)
           [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
@@ -105,6 +105,8 @@ jobs:
             echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
             exit 1
           fi
+          test -x bash/build.sh
+          test -f bash/compat/android_compat.c
           echo "bash=$BASH_VER api=$API ndk=$NDK_VERSION abis=${{ steps.abis.outputs.csv }}"
 
       - name: Install host tools
@@ -145,12 +147,10 @@ jobs:
       - name: Build bash
         run: |
           set -euo pipefail
-          chmod +x ./build-android-bash.sh
+          chmod +x bash/build.sh
           # shellcheck disable=SC2086
-          ./build-android-bash.sh ${{ steps.abis.outputs.list }}
+          ./bash/build.sh ${{ steps.abis.outputs.list }}
 
-      # Stage each ABI as its own bare binary: bash-<version>-<abi>
-      # Map build dirs → short names used in asset filenames.
       - name: Stage per-ABI binaries
         id: pack
         run: |
@@ -159,7 +159,6 @@ jobs:
           found=0
           asset_list=()
 
-          # out-dir-name → short abi slug for filename
           declare -A MAP=(
             [arm64-v8a]=arm64
             [armeabi-v7a]=arm
@@ -168,16 +167,15 @@ jobs:
           )
 
           for dir in arm64-v8a armeabi-v7a x86_64 x86; do
-            src="out/${dir}/bash"
+            src="bash/out/${dir}/bash"
             [[ -f "$src" ]] || continue
             short="${MAP[$dir]}"
             name="bash-${BASH_VER}-${short}"
             dest="release-assets/${name}"
             cp -a "$src" "$dest"
             chmod 755 "$dest"
-            # Keep BUILD_INFO next to it for the workflow artifact (not uploaded to Release)
-            if [[ -f "out/${dir}/BUILD_INFO.txt" ]]; then
-              cp -a "out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
+            if [[ -f "bash/out/${dir}/BUILD_INFO.txt" ]]; then
+              cp -a "bash/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
             fi
             file "$dest" | tee -a dist/SUMMARY.txt
             ls -lh "$dest" | tee -a dist/SUMMARY.txt
@@ -186,8 +184,8 @@ jobs:
           done
 
           if [[ "$found" -eq 0 ]]; then
-            echo "::error::No bash binaries produced under out/"
-            find out -type f 2>/dev/null || true
+            echo "::error::No bash binaries produced under bash/out/"
+            find bash/out -type f 2>/dev/null || true
             exit 1
           fi
 
@@ -196,6 +194,7 @@ jobs:
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
+            echo "package: bash/"
             echo "assets:"
             for a in "${asset_list[@]}"; do
               echo "  - $(basename "$a")"
@@ -205,7 +204,6 @@ jobs:
             echo "commit: ${{ github.sha }}"
           } | tee dist/RELEASE_NOTES.txt
 
-          # newline-separated list for the release step
           {
             for a in "${asset_list[@]}"; do
               echo "$a"
@@ -214,7 +212,6 @@ jobs:
 
           echo "notes_path=dist/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
           echo "asset_count=${#asset_list[@]}" >> "$GITHUB_OUTPUT"
-          echo "Staged ${#asset_list[@]} asset(s):"
           ls -lh release-assets/
 
       - name: Upload workflow artifacts (per-ABI binaries)
@@ -228,8 +225,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # One Release tag per bash version; each ABI is a separate downloadable asset
-      # named bash-<version>-<abi> (bare binary, no zip).
       - name: Create / update GitHub Release
         if: ${{ inputs.create_release }}
         env:
@@ -251,18 +246,15 @@ jobs:
             gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
           else
             echo "Creating release $TAG"
-            # create without assets first, then upload one-by-one
             gh release create "$TAG" \
               --title "$TITLE" \
               --notes-file "$NOTES_FILE" \
               --latest=false
           fi
 
-          # Upload each ABI binary individually (clobber if re-run same version)
           for asset in "${ASSETS[@]}"; do
             name="$(basename "$asset")"
             echo "==> upload $name"
-            # --clobber replaces same-named asset on re-publish
             gh release upload "$TAG" "$asset" --clobber
           done
 

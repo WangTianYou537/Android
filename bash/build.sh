@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Build GNU bash for Android (PIE, dynamically linked against Bionic)
-# Usage:
-#   ./build-android-bash.sh                    # default: arm64 API 24
-#   ./build-android-bash.sh arm64
-#   ./build-android-bash.sh arm64 arm          # multi-ABI
-#   ./build-android-bash.sh all                # all four ABIs
-#   ./build-android-bash.sh arm64 x86_64
-#   API=28 ./build-android-bash.sh arm64 arm
-#   NDK=/path/to/ndk ./build-android-bash.sh arm64
-#   BASH_VER=5.2.37 ./build-android-bash.sh all
+# Usage (from repo root or bash/):
+#   ./bash/build.sh                            # default: arm64 API 24
+#   ./bash/build.sh arm64
+#   ./bash/build.sh arm64 arm                  # multi-ABI
+#   ./bash/build.sh all                        # all four ABIs
+#   API=28 ./bash/build.sh arm64 arm
+#   BASH_VER=5.2.37 ./bash/build.sh all
+#   NDK=/path/to/ndk ./bash/build.sh arm64
 #
 #
 # Why not fully static?
@@ -24,8 +23,12 @@ BASH_VER="${BASH_VER:-5.2.37}"
 API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 
+# Package dir = bash/; repo root = parent (for shared NDK / future packages)
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+
 if [[ -z "${NDK:-}" ]]; then
   for cand in \
+    "$REPO_ROOT/android-ndk-r27d" \
     "$ROOT/android-ndk-r27d" \
     /opt/android-ndk-r27d \
     "$BUILD_ROOT/android-ndk-r27d" \
@@ -137,7 +140,7 @@ resolve_abi() {
     *)
       echo "Unknown ABI: $1"
       echo "Supported: arm64, arm, x86_64, x86, all"
-      echo "Multiple ABIs: ./build-android-bash.sh arm64 arm x86_64"
+      echo "Multiple ABIs: ./bash/build.sh arm64 arm x86_64"
       exit 1
       ;;
   esac
