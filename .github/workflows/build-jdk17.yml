@@ -1,0 +1,317 @@
+# Build OpenJDK 17 for Android (package: jdk/jdk17/)
+# Actions → "Build Android JDK 17" → Run workflow
+# Release: one tar.xz per ABI — jre17-<abi>.tar.xz / jdk17-<abi>.tar.xz (no mega-zip).
+#
+# NOTE: full OpenJDK cross-build is heavy (often 1–3h per ABI on ubuntu-latest).
+# Default ABI selection is arm64 only; enable others only if you need them.
+name: Build Android JDK 17
+
+on:
+  workflow_dispatch:
+    inputs:
+      jdk_tag:
+        description: "OpenJDK 17u git tag (e.g. jdk-17.0.10-ga, jdk-17.0.13-ga)"
+        required: true
+        type: string
+        default: "jdk-17.0.10-ga"
+      api:
+        description: "Min Android API level"
+        required: true
+        type: string
+        default: "24"
+      abi_arm64:
+        description: "ABI · arm64-v8a (aarch64)"
+        required: true
+        type: boolean
+        default: true
+      abi_arm:
+        description: "ABI · armeabi-v7a (armv7)"
+        required: true
+        type: boolean
+        default: false
+      abi_x86_64:
+        description: "ABI · x86_64"
+        required: true
+        type: boolean
+        default: false
+      abi_x86:
+        description: "ABI · x86 (i686)"
+        required: true
+        type: boolean
+        default: false
+      ndk_version:
+        description: "NDK release name (android-ndk-<name>-linux.zip)"
+        required: true
+        type: string
+        default: "r27d"
+      jobs:
+        description: "make -j N (Hotspot is RAM-heavy; 2 is safer on free runners)"
+        required: true
+        type: string
+        default: "2"
+      create_release:
+        description: "Publish JRE/JDK tar.xz assets to GitHub Release (tag jdk17-<tag>)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-jdk17-${{ github.ref }}-${{ inputs.jdk_tag }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}-${{ inputs.api }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: jdk17 ${{ inputs.jdk_tag }}
+    runs-on: ubuntu-latest
+    # OpenJDK cross builds are long; allow a full afternoon
+    timeout-minutes: 480
+
+    env:
+      JDK_TAG: ${{ inputs.jdk_tag }}
+      API: ${{ inputs.api }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+      JOBS: ${{ inputs.jobs }}
+      JOBS_FORCE: ${{ inputs.jobs }}
+      BUILD_ROOT: ${{ github.workspace }}/.build/jdk17
+      NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
+      OUT_DIR: ${{ github.workspace }}/jdk/jdk17/out
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve selected ABIs
+        id: abis
+        run: |
+          set -euo pipefail
+          selected=()
+          [[ "${{ inputs.abi_arm64 }}"  == "true" ]] && selected+=(arm64)
+          [[ "${{ inputs.abi_arm }}"    == "true" ]] && selected+=(arm)
+          [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
+          [[ "${{ inputs.abi_x86 }}"    == "true" ]] && selected+=(x86)
+          if [[ ${#selected[@]} -eq 0 ]]; then
+            echo "::error::Select at least one ABI checkbox."
+            exit 1
+          fi
+          echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+          echo "Selected ABIs: ${selected[*]}"
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "$JDK_TAG" =~ ^jdk-17(\.[0-9]+)*(-[a-z0-9.]+)?$ ]]; then
+            echo "::error::jdk_tag must look like jdk-17.0.10-ga (got: $JDK_TAG)"
+            exit 1
+          fi
+          if [[ ! "$API" =~ ^[0-9]+$ ]] || (( API < 21 || API > 35 )); then
+            echo "::error::api must be an integer 21–35 (got: $API)"
+            exit 1
+          fi
+          if [[ ! "$NDK_VERSION" =~ ^r[0-9]+[a-z]?$ ]]; then
+            echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
+            exit 1
+          fi
+          if [[ ! "$JOBS" =~ ^[0-9]+$ ]] || (( JOBS < 1 || JOBS > 16 )); then
+            echo "::error::jobs must be 1–16 (got: $JOBS)"
+            exit 1
+          fi
+          test -x jdk/jdk17/build.sh
+          test -f jdk/jdk17/patches/jdk17u_android.diff
+          echo "tag=$JDK_TAG api=$API ndk=$NDK_VERSION jobs=$JOBS abis=${{ steps.abis.outputs.csv }}"
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          # OpenJDK + images can exceed free-runner disk; drop unused toolchains.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+            /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host tools + boot JDK 17
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            openjdk-17-jdk-headless \
+            build-essential autoconf file wget curl git zip unzip \
+            python3 python-is-python3 \
+            libxtst-dev libasound2-dev libelf-dev libfontconfig1-dev \
+            libx11-dev libxext-dev libxrandr-dev libxrender-dev libxt-dev \
+            clang libstdc++-12-dev \
+            xz-utils
+          java -version
+          javac -version
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Download & extract NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NDK")"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          url="https://dl.google.com/android/repository/${zip}"
+          echo "Downloading $url"
+          wget -q --show-progress -O "/tmp/${zip}" "$url"
+          echo "Extracting..."
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          cat "$NDK/source.properties"
+
+      - name: Cache OpenJDK source clone
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_ROOT }}/openjdk
+          key: openjdk-src-${{ env.JDK_TAG }}
+
+      - name: Build OpenJDK for Android
+        run: |
+          set -euo pipefail
+          chmod +x jdk/jdk17/build.sh
+          export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))
+          echo "JAVA_HOME=$JAVA_HOME"
+          # shellcheck disable=SC2086
+          ./jdk/jdk17/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Stage release assets (per-ABI tar.xz)
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p dist release-assets
+          found=0
+          asset_list=()
+
+          declare -A MAP=(
+            [arm64-v8a]=arm64
+            [armeabi-v7a]=arm
+            [x86_64]=x86_64
+            [x86]=x86
+          )
+
+          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
+            base="jdk/jdk17/out/${dir}"
+            [[ -d "$base" ]] || continue
+            short="${MAP[$dir]}"
+            for kind in jre jdk; do
+              # Prefer stable name produced by build.sh; fall back to dated tarball
+              src=""
+              if [[ -f "${base}/${kind}17-${short}.tar.xz" ]]; then
+                src="${base}/${kind}17-${short}.tar.xz"
+              else
+                src=$(ls -1 "${base}/${kind}17-${short}-"*.tar.xz 2>/dev/null | head -1 || true)
+              fi
+              [[ -n "$src" && -f "$src" ]] || continue
+              # Release asset: jre17-arm64.tar.xz / jdk17-arm64.tar.xz
+              name="${kind}17-${short}.tar.xz"
+              dest="release-assets/${name}"
+              cp -a "$src" "$dest"
+              ls -lh "$dest" | tee -a dist/SUMMARY.txt
+              file "$dest" | tee -a dist/SUMMARY.txt || true
+              asset_list+=("$dest")
+              found=1
+            done
+            if [[ -f "${base}/BUILD_INFO.txt" ]]; then
+              cp -a "${base}/BUILD_INFO.txt" "release-assets/BUILD_INFO-${short}.txt"
+            fi
+          done
+
+          if [[ "$found" -eq 0 ]]; then
+            echo "::error::No jre/jdk tar.xz under jdk/jdk17/out/"
+            find jdk/jdk17/out -type f 2>/dev/null | head -50 || true
+            exit 1
+          fi
+
+          {
+            echo "OpenJDK ${JDK_TAG} (Android / Bionic, headless)"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
+            echo "min Android API: ${API}"
+            echo "NDK: ${NDK_VERSION}"
+            echo "JOBS: ${JOBS}"
+            echo "package: jdk/jdk17/"
+            echo "assets:"
+            for a in "${asset_list[@]}"; do
+              echo "  - $(basename "$a")  ($(du -h "$a" | awk '{print $1}'))"
+            done
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
+            echo "commit: ${{ github.sha }}"
+            echo
+            echo "Install on device (example arm64 JRE):"
+            echo "  adb push jre17-arm64.tar.xz /data/local/tmp/"
+            echo "  adb shell 'mkdir -p /data/local/tmp/jre17 && tar -xJf /data/local/tmp/jre17-arm64.tar.xz -C /data/local/tmp/jre17'"
+            echo "  adb shell /data/local/tmp/jre17/bin/java -version"
+          } | tee dist/RELEASE_NOTES.txt
+
+          {
+            for a in "${asset_list[@]}"; do
+              echo "$a"
+            done
+          } > dist/asset-files.txt
+
+          echo "notes_path=dist/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
+          echo "asset_count=${#asset_list[@]}" >> "$GITHUB_OUTPUT"
+          ls -lh release-assets/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk17-${{ inputs.jdk_tag }}
+          path: |
+            release-assets/*
+            dist/RELEASE_NOTES.txt
+            dist/SUMMARY.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create / update GitHub Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tag: jdk17-jdk-17.0.10-ga  (keeps OpenJDK tag readable)
+          TAG="jdk17-${JDK_TAG}"
+          TITLE="OpenJDK ${JDK_TAG} for Android"
+          NOTES_FILE="dist/RELEASE_NOTES.txt"
+          mapfile -t ASSETS < dist/asset-files.txt
+
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "::error::No release assets staged"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes and re-uploading assets"
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes-file "$NOTES_FILE" \
+              --latest=false
+          fi
+
+          for asset in "${ASSETS[@]}"; do
+            name="$(basename "$asset")"
+            echo "==> upload $name"
+            gh release upload "$TAG" "$asset" --clobber
+          done
+
+          # Also upload BUILD_INFO files if present
+          for info in release-assets/BUILD_INFO-*.txt; do
+            [[ -f "$info" ]] || continue
+            gh release upload "$TAG" "$info" --clobber || true
+          done
+
+          echo "Release $TAG assets:"
+          gh release view "$TAG" --json assets --jq '.assets[].name'

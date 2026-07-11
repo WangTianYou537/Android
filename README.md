@@ -8,16 +8,24 @@
 ```
 .
 ├── bash/                      # GNU bash 包
-│   ├── build.sh               # 交叉编译入口
+│   ├── build.sh
 │   ├── compat/android_compat.c
-│   ├── out/<abi>/bash         # 本地构建产物（gitignore）
+│   ├── out/<abi>/…            # gitignore
 │   └── README.md
+├── jdk/
+│   └── jdk17/                 # OpenJDK 17 (headless JRE/JDK)
+│       ├── build.sh
+│       ├── patches/
+│       ├── jre_override/
+│       ├── out/<abi>/…        # gitignore
+│       └── README.md
 ├── common/
 │   └── env-ndk.sh             # 各包共用的 NDK 环境
 ├── .github/workflows/
-│   └── build-bash.yml         # bash 手动触发 CI
+│   ├── build-bash.yml
+│   └── build-jdk17.yml
 ├── .gitignore
-└── README.md                  # 本文件
+└── README.md
 ```
 
 约定（后续新包照此加）：
@@ -51,8 +59,11 @@ echo $NDK
 | 包 | 说明 | 本地构建 | CI |
 |----|------|----------|-----|
 | [bash](bash/) | GNU bash（动态 PIE） | `./bash/build.sh arm64` | [Build Android bash](.github/workflows/build-bash.yml) |
+| [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
 
-## 快速开始（bash）
+## 快速开始
+
+### bash
 
 ```bash
 source common/env-ndk.sh
@@ -64,3 +75,16 @@ adb shell /data/local/tmp/bash --version
 
 CI 产物命名：`bash-<version>-<abi>`（每个 ABI 单独文件，不打 zip）。  
 详见 [bash/README.md](bash/README.md)。
+
+### jdk17
+
+```bash
+source common/env-ndk.sh
+./jdk/jdk17/build.sh arm64          # 约 1–3 小时
+adb push jdk/jdk17/out/arm64-v8a/jre17-arm64.tar.xz /data/local/tmp/
+adb shell 'mkdir -p /data/local/tmp/jre17 && tar -xJf /data/local/tmp/jre17-arm64.tar.xz -C /data/local/tmp/jre17'
+adb shell /data/local/tmp/jre17/bin/java -version
+```
+
+CI 产物：`jre17-<abi>.tar.xz` / `jdk17-<abi>.tar.xz`（每个 ABI 单独文件）。  
+详见 [jdk/jdk17/README.md](jdk/jdk17/README.md)。
