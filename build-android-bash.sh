@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Build GNU bash for Android (PIE, dynamically linked against Bionic)
 # Usage:
-#   ./build-android-bash.sh              # default: aarch64 API 24
+#   ./build-android-bash.sh                    # default: arm64 API 24
 #   ./build-android-bash.sh arm64
-#   ./build-android-bash.sh arm          # armeabi-v7a
-#   ./build-android-bash.sh x86_64
-#   ./build-android-bash.sh x86
-#   ./build-android-bash.sh all
-#   API=28 ./build-android-bash.sh arm64
+#   ./build-android-bash.sh arm64 arm          # multi-ABI
+#   ./build-android-bash.sh all                # all four ABIs
+#   ./build-android-bash.sh arm64 x86_64
+#   API=28 ./build-android-bash.sh arm64 arm
 #   NDK=/path/to/ndk ./build-android-bash.sh arm64
+#   BASH_VER=5.2.37 ./build-android-bash.sh all
+#
 #
 # Why not fully static?
 #   Static arm64 binaries abort on modern Android Bionic with:
@@ -136,6 +137,7 @@ resolve_abi() {
     *)
       echo "Unknown ABI: $1"
       echo "Supported: arm64, arm, x86_64, x86, all"
+      echo "Multiple ABIs: ./build-android-bash.sh arm64 arm x86_64"
       exit 1
       ;;
   esac
@@ -258,17 +260,49 @@ PY
   log "OK -> $dest/bash"
 }
 
+# Expand "all" / dedupe while preserving order
+expand_targets() {
+  local -a raw=("$@")
+  local -a out=()
+  local t a
+  if [[ ${#raw[@]} -eq 0 ]]; then
+    raw=(arm64)
+  fi
+  for t in "${raw[@]}"; do
+    if [[ "$t" == "all" ]]; then
+      out+=(arm64 arm x86_64 x86)
+    else
+      out+=("$t")
+    fi
+  done
+  # dedupe
+  local -a uniq=()
+  for a in "${out[@]}"; do
+    local seen=0
+    for u in "${uniq[@]+"${uniq[@]}"}"; do
+      [[ "$u" == "$a" ]] && { seen=1; break; }
+    done
+    [[ $seen -eq 0 ]] && uniq+=("$a")
+  done
+  printf '%s\n' "${uniq[@]}"
+}
+
 main() {
   ensure_source
   ensure_compat
-  local target="${1:-arm64}"
-  if [[ "$target" == "all" ]]; then
-    for a in arm64 arm x86_64 x86; do
-      build_one "$a"
-    done
-  else
-    build_one "$target"
+
+  local -a targets
+  mapfile -t targets < <(expand_targets "$@")
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    targets=(arm64)
   fi
+
+  log "Targets: ${targets[*]}"
+  local t
+  for t in "${targets[@]}"; do
+    build_one "$t"
+  done
+
   log "Done. Binaries under: $OUT_DIR"
   find "$OUT_DIR" -type f -name bash -exec ls -lh {} \;
 }

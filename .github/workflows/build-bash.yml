@@ -1,5 +1,5 @@
-# Manual build of GNU bash for Android (all or selected ABIs).
-# Actions → "Build Android bash" → Run workflow → fill bash_version.
+# Manual build of GNU bash for Android (multi-select ABIs via checkboxes).
+# Actions → "Build Android bash" → Run workflow → fill bash_version + tick ABIs.
 name: Build Android bash
 
 on:
@@ -15,24 +15,33 @@ on:
         required: true
         type: string
         default: "24"
-      abis:
-        description: "ABIs to build"
+      abi_arm64:
+        description: "ABI · arm64-v8a (aarch64)"
         required: true
-        type: choice
-        default: all
-        options:
-          - all
-          - arm64
-          - arm
-          - x86_64
-          - x86
+        type: boolean
+        default: true
+      abi_arm:
+        description: "ABI · armeabi-v7a (armv7)"
+        required: true
+        type: boolean
+        default: true
+      abi_x86_64:
+        description: "ABI · x86_64"
+        required: true
+        type: boolean
+        default: true
+      abi_x86:
+        description: "ABI · x86 (i686)"
+        required: true
+        type: boolean
+        default: true
       ndk_version:
         description: "NDK release name (matches Google zip android-ndk-<name>-linux.zip)"
         required: true
         type: string
         default: "r27d"
       create_release:
-        description: "Upload binaries as a GitHub Release (tag bash-<version>)"
+        description: "Upload binaries as a GitHub Release (tag bash-<version>-api<api>)"
         required: true
         type: boolean
         default: false
@@ -41,14 +50,14 @@ permissions:
   contents: write  # needed only when create_release=true
 
 concurrency:
-  group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.abis }}
+  group: build-bash-${{ github.ref }}-${{ inputs.bash_version }}-${{ inputs.api }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: bash ${{ inputs.bash_version }} / ${{ inputs.abis }} / API ${{ inputs.api }}
+    name: bash ${{ inputs.bash_version }} / API ${{ inputs.api }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       BASH_VER: ${{ inputs.bash_version }}
@@ -61,6 +70,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve selected ABIs
+        id: abis
+        run: |
+          set -euo pipefail
+          selected=()
+          # GitHub passes boolean inputs as the strings "true" / "false"
+          [[ "${{ inputs.abi_arm64 }}"  == "true" ]] && selected+=(arm64)
+          [[ "${{ inputs.abi_arm }}"    == "true" ]] && selected+=(arm)
+          [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
+          [[ "${{ inputs.abi_x86 }}"    == "true" ]] && selected+=(x86)
+          if [[ ${#selected[@]} -eq 0 ]]; then
+            echo "::error::Select at least one ABI checkbox (arm64 / arm / x86_64 / x86)."
+            exit 1
+          fi
+          # space-separated for the build script; comma for display
+          echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+          echo "Selected ABIs: ${selected[*]}"
 
       - name: Validate inputs
         run: |
@@ -77,7 +105,7 @@ jobs:
             echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
             exit 1
           fi
-          echo "bash=$BASH_VER api=$API ndk=$NDK_VERSION abis=${{ inputs.abis }}"
+          echo "bash=$BASH_VER api=$API ndk=$NDK_VERSION abis=${{ steps.abis.outputs.csv }}"
 
       - name: Install host tools
         run: |
@@ -118,7 +146,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./build-android-bash.sh
-          ./build-android-bash.sh "${{ inputs.abis }}"
+          # shellcheck disable=SC2086
+          ./build-android-bash.sh ${{ steps.abis.outputs.list }}
 
       - name: Collect artifacts
         id: pack
@@ -126,7 +155,6 @@ jobs:
           set -euo pipefail
           stage="dist/bash-${BASH_VER}-android-api${API}"
           mkdir -p "$stage"
-          # Copy per-ABI binaries + build info
           found=0
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
             if [[ -f "out/${abi}/bash" ]]; then
@@ -138,7 +166,7 @@ jobs:
               found=1
             fi
           done
-          if [[ "$found" -ne 1 ]]; then
+          if [[ "$found" -eq 0 ]]; then
             echo "::error::No bash binaries produced under out/"
             find out -type f 2>/dev/null || true
             exit 1
@@ -147,12 +175,11 @@ jobs:
             echo "bash ${BASH_VER}"
             echo "API ${API}"
             echo "NDK ${NDK_VERSION}"
-            echo "ABIs: ${{ inputs.abis }}"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
             echo "commit: ${{ github.sha }}"
           } | tee "$stage/RELEASE_NOTES.txt"
-          # Zip for download convenience
           (cd dist && zip -r "bash-${BASH_VER}-android-api${API}.zip" "bash-${BASH_VER}-android-api${API}")
           echo "artifact_name=bash-${BASH_VER}-android-api${API}" >> "$GITHUB_OUTPUT"
           echo "zip_path=dist/bash-${BASH_VER}-android-api${API}.zip" >> "$GITHUB_OUTPUT"

@@ -66,14 +66,14 @@ aarch64-linux-android24-clang --version
 ## 重新编译
 
 ```bash
-./build-android-bash.sh            # 默认 arm64 API 24
+./build-android-bash.sh                 # 默认 arm64 API 24
 ./build-android-bash.sh arm64
-./build-android-bash.sh arm        # armeabi-v7a
-./build-android-bash.sh x86_64
-./build-android-bash.sh x86
-./build-android-bash.sh all        # 四个 ABI
+./build-android-bash.sh arm64 arm       # 多 ABI
+./build-android-bash.sh arm64 x86_64
+./build-android-bash.sh all             # 四个 ABI
 
-API=28 ./build-android-bash.sh arm64   # 指定 min API
+API=28 ./build-android-bash.sh arm64 arm
+BASH_VER=5.2.37 ./build-android-bash.sh all
 NDK=/opt/android-ndk-r27d ./build-android-bash.sh arm64
 ```
 
@@ -141,19 +141,31 @@ Workflow 文件：`.github/workflows/build-bash.yml`
 |------|------|------|
 | `bash_version` | GNU bash 版本号，如 `5.2.37` / `5.3` | `5.2.37` |
 | `api` | 最低 Android API（21–35） | `24` |
-| `abis` | `all` / `arm64` / `arm` / `x86_64` / `x86` | `all` |
+| `abi_arm64` | 勾选编译 arm64-v8a | ✅ true |
+| `abi_arm` | 勾选编译 armeabi-v7a | ✅ true |
+| `abi_x86_64` | 勾选编译 x86_64 | ✅ true |
+| `abi_x86` | 勾选编译 x86 | ✅ true |
 | `ndk_version` | NDK 发行名，对应 Google 包名 `android-ndk-<name>-linux.zip` | `r27d` |
 | `create_release` | 是否额外打 GitHub Release（tag `bash-<ver>-api<api>`） | `false` |
+
+> GitHub 的 `choice` 输入不支持多选，因此每个 ABI 用一个 **boolean 勾选框**，可任意组合。
 
 ### 命令行触发
 
 ```bash
+# 只编 arm64 + arm
 gh workflow run build-bash.yml \
   -f bash_version=5.2.37 \
   -f api=24 \
-  -f abis=arm64 \
+  -f abi_arm64=true \
+  -f abi_arm=true \
+  -f abi_x86_64=false \
+  -f abi_x86=false \
   -f ndk_version=r27d \
   -f create_release=false
+
+# 四个 ABI 全开（默认 true，可省略勾选参数）
+gh workflow run build-bash.yml -f bash_version=5.2.37
 ```
 
 ### 产物
