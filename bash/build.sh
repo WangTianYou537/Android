@@ -15,18 +15,22 @@
 #   Static arm64 binaries abort on modern Android Bionic with:
 #     "executable's TLS segment is underaligned: alignment is 8, needs to be at least 64"
 #   Link dynamically against Bionic instead (only needs system libc/libdl).
+#
+# Notes:
+#   - getgrent/getpwent family is forced off for API < 26 (Bionic).
+#     Only group/username DB completion is lost; path/cmd Tab still works.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/bash4droid-build}"
-BASH_VER="${BASH_VER:-5.2.37}"
+BASH_VER="${BASH_VER:-5.3}"
 API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 
 # Versions of readline & ncurses to cross-compile
-READLINE_VER="${READLINE_VER:-8.2}"
-NCURSES_VER="${NCURSES_VER:-6.4}"
+READLINE_VER="${READLINE_VER:-8.3}"
+NCURSES_VER="${NCURSES_VER:-6.5}"
 
 # Package dir = bash/; repo root = parent (for shared NDK / future packages)
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
@@ -358,8 +362,9 @@ build_one() {
   export RANLIB=llvm-ranlib
   export STRIP=llvm-strip
   # Dynamic PIE against Bionic — avoids arm64 static TLS underalignment abort.
-  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
-  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
+  # Force-off getgrent/getpwent macros as a belt-and-suspenders for API < 26.
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -UHAVE_GETGRENT -UHAVE_GETPWENT -UHAVE_SETGRENT -UHAVE_ENDGRENT -UHAVE_SETPWENT -UHAVE_ENDPWENT"
+  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -UHAVE_GETGRENT -UHAVE_GETPWENT -UHAVE_SETGRENT -UHAVE_ENDGRENT -UHAVE_SETPWENT -UHAVE_ENDPWENT"
   export LDFLAGS="-pie -L${prefix_dir}/lib"
   export LIBS="-lreadline -lncursesw -ltinfow"
   export PKG_CONFIG_PATH="${prefix_dir}/lib/pkgconfig"
@@ -367,6 +372,9 @@ build_one() {
   # Cross-compile aarch64 mblen shim
   "$CC" $CFLAGS -c "$ROOT/compat/android_compat.c" -o android_compat.o
 
+  # getgrent/getpwent: Bionic only exposes proper headers from API 26+.
+  # Force no so bashline group/user DB completion is not compiled in.
+  # Path / command / variable Tab completion is unaffected.
   "$BUILD_ROOT/bash-${BASH_VER}/configure" \
     --host="${TRIPLE}" \
     --build="$(uname -m)-pc-linux-gnu" \
@@ -393,7 +401,17 @@ build_one() {
     ac_cv_c_bigendian=no \
     ac_cv_func_setvbuf_reversed=no \
     gt_cv_int_divbyzero_sigfpe=yes \
-    >configure.log 2>&1
+    ac_cv_func_getgrent=no \
+    ac_cv_func_setgrent=no \
+    ac_cv_func_endgrent=no \
+    ac_cv_func_getpwent=no \
+    ac_cv_func_setpwent=no \
+    ac_cv_func_endpwent=no \
+    >configure.log 2>&1 || {
+      echo "ERROR: bash configure failed. See $build_dir/configure.log"
+      tail -40 configure.log
+      exit 1
+    }
 
   # -rdynamic is useless on Android; drop it
   sed -i 's/^LOCAL_LDFLAGS = -rdynamic/LOCAL_LDFLAGS = /' Makefile
@@ -451,6 +469,7 @@ PY
     echo "readline: yes (${READLINE_VER})"
     echo "ncurses: yes (${NCURSES_VER}, wide-char)"
     echo "compat: mblen via android_compat.o"
+    echo "getgrent/getpwent: disabled (Android API < 26 safe)"
     file "$dest/bash"
     ls -lh "$dest/bash"
     echo "--- needed libs ---"
