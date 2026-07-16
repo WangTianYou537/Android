@@ -1,0 +1,250 @@
+# Build official curl for Android (package: curl/)
+# Actions → "Build Android curl" → Run workflow
+# Release assets: one bare binary per ABI named curl-<version>-<abi>
+name: Build Android curl
+
+on:
+  workflow_dispatch:
+    inputs:
+      curl_version:
+        description: "curl version (official tarball, e.g. 8.21.0)"
+        required: true
+        type: string
+        default: "8.21.0"
+      openssl_version:
+        description: "OpenSSL version (static backend)"
+        required: true
+        type: string
+        default: "3.3.3"
+      zlib_version:
+        description: "zlib version (static)"
+        required: true
+        type: string
+        default: "1.3.1"
+      api:
+        description: "Min Android API level"
+        required: true
+        type: string
+        default: "24"
+      abi_arm64:
+        description: "ABI · arm64-v8a (aarch64)"
+        required: true
+        type: boolean
+        default: true
+      abi_arm:
+        description: "ABI · armeabi-v7a (armv7)"
+        required: true
+        type: boolean
+        default: true
+      abi_x86_64:
+        description: "ABI · x86_64"
+        required: true
+        type: boolean
+        default: true
+      abi_x86:
+        description: "ABI · x86 (i686)"
+        required: true
+        type: boolean
+        default: true
+      ndk_version:
+        description: "NDK release name (android-ndk-<name>-linux.zip)"
+        required: true
+        type: string
+        default: "r27d"
+      create_release:
+        description: "Publish each ABI as a separate release asset (curl-<version>-<abi>)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-curl-${{ github.ref }}-${{ inputs.curl_version }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}-${{ inputs.api }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: curl ${{ inputs.curl_version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      CURL_VER: ${{ inputs.curl_version }}
+      OPENSSL_VER: ${{ inputs.openssl_version }}
+      ZLIB_VER: ${{ inputs.zlib_version }}
+      API: ${{ inputs.api }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+      BUILD_ROOT: ${{ github.workspace }}/.build/curl
+      NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
+      OUT_DIR: ${{ github.workspace }}/curl/out
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve selected ABIs
+        id: abis
+        run: |
+          set -euo pipefail
+          selected=()
+          [[ "${{ inputs.abi_arm64 }}"  == "true" ]] && selected+=(arm64)
+          [[ "${{ inputs.abi_arm }}"    == "true" ]] && selected+=(arm)
+          [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
+          [[ "${{ inputs.abi_x86 }}"    == "true" ]] && selected+=(x86)
+          if [[ ${#selected[@]} -eq 0 ]]; then
+            echo "::error::Select at least one ABI"
+            exit 1
+          fi
+          echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+          echo "Selected ABIs: ${selected[*]}"
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "$CURL_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::curl_version must look like 8.21.0 (got: $CURL_VER)"
+            exit 1
+          fi
+          if [[ ! "$OPENSSL_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::openssl_version must look like 3.3.3"
+            exit 1
+          fi
+          if [[ ! "$ZLIB_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::zlib_version must look like 1.3.1"
+            exit 1
+          fi
+          if [[ ! "$API" =~ ^[0-9]+$ ]] || (( API < 21 || API > 35 )); then
+            echo "::error::api must be 21–35"
+            exit 1
+          fi
+          if [[ ! "$NDK_VERSION" =~ ^r[0-9]+[a-z]?$ ]]; then
+            echo "::error::ndk_version must look like r27d"
+            exit 1
+          fi
+          test -x curl/build.sh || chmod +x curl/build.sh
+          echo "curl=$CURL_VER openssl=$OPENSSL_VER zlib=$ZLIB_VER api=$API abis=${{ steps.abis.outputs.csv }}"
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential perl wget curl file binutils python3
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Download & extract NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NDK")"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          url="https://dl.google.com/android/repository/${zip}"
+          wget -q --show-progress -O "/tmp/${zip}" "$url"
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          cat "$NDK/source.properties"
+
+      - name: Verify NDK
+        run: |
+          set -euo pipefail
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -2
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E "aarch64-linux-android${API}-clang$" | head -3
+
+      - name: Build curl
+        run: |
+          set -euo pipefail
+          chmod +x curl/build.sh
+          # shellcheck disable=SC2086
+          ./curl/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Stage per-ABI binaries
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p dist release-assets
+          found=0
+          asset_list=()
+          declare -A MAP=(
+            [arm64-v8a]=arm64
+            [armeabi-v7a]=arm
+            [x86_64]=x86_64
+            [x86]=x86
+          )
+          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
+            src="curl/out/${dir}/curl"
+            [[ -f "$src" ]] || continue
+            short="${MAP[$dir]}"
+            name="curl-${CURL_VER}-${short}"
+            dest="release-assets/${name}"
+            cp -a "$src" "$dest"
+            chmod 755 "$dest"
+            if [[ -f "curl/out/${dir}/BUILD_INFO.txt" ]]; then
+              cp -a "curl/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
+            fi
+            file "$dest" | tee -a dist/SUMMARY.txt
+            ls -lh "$dest" | tee -a dist/SUMMARY.txt
+            asset_list+=("$dest")
+            found=1
+          done
+          if [[ "$found" -eq 0 ]]; then
+            echo "::error::No curl binaries under curl/out/"
+            find curl/out -type f 2>/dev/null || true
+            exit 1
+          fi
+          {
+            echo "curl ${CURL_VER} (official)"
+            echo "OpenSSL ${OPENSSL_VER} (static)"
+            echo "zlib ${ZLIB_VER} (static)"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
+            echo "min Android API: ${API}"
+            echo "NDK: ${NDK_VERSION}"
+            echo "source: https://curl.se/download/curl-${CURL_VER}.tar.xz"
+            echo "assets:"
+            for a in "${asset_list[@]}"; do echo "  - $(basename "$a")"; done
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit: ${{ github.sha }}"
+          } | tee dist/RELEASE_NOTES.txt
+          {
+            for a in "${asset_list[@]}"; do echo "$a"; done
+          } > dist/asset-files.txt
+          ls -lh release-assets/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: curl-${{ inputs.curl_version }}
+          path: |
+            release-assets/curl-*
+            dist/RELEASE_NOTES.txt
+            dist/SUMMARY.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create / update GitHub Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="curl-${CURL_VER}"
+          TITLE="curl ${CURL_VER} (Android, OpenSSL static)"
+          NOTES_FILE="dist/RELEASE_NOTES.txt"
+          mapfile -t ASSETS < dist/asset-files.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --latest=false
+          fi
+          for asset in "${ASSETS[@]}"; do
+            echo "==> upload $(basename "$asset")"
+            gh release upload "$TAG" "$asset" --clobber
+          done
+          gh release view "$TAG" --json assets --jq '.assets[].name'
