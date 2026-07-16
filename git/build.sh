@@ -37,6 +37,8 @@ API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 JOBS="$(nproc 2>/dev/null || echo 2)"
+LINK_MODE="${LINK_MODE:-static}"   # static|dynamic
+DEPS_PREFIX="${DEPS_PREFIX:-}"     # dynamic: common/deps/out/<ABI>
 
 if [[ -z "${NDK:-}" ]]; then
   for cand in \
@@ -229,26 +231,43 @@ build_one() {
   local name="$1"
   resolve_abi "$name"
 
-  local prefix="$BUILD_ROOT/prefix-$ABI"
-  # Reuse curl package prefix when available
-  if [[ -f /tmp/curl-android-build/prefix-$ABI/lib/libssl.a ]]; then
-    prefix="/tmp/curl-android-build/prefix-$ABI"
-    log "Reusing deps prefix: $prefix"
-  fi
-
+  local prefix
   local dest="$OUT_DIR/$ABI"
   local cc="${CLANG_PREFIX}${API}-clang"
   local compat_h="$ROOT/compat/android_compat.h"
   local bdir="$BUILD_ROOT/git-build-$ABI"
+  local rpath_flag=""
+  local curl_libs=""
+  local ext_libs=""
 
-  mkdir -p "$prefix" "$dest/bin" "$dest/libexec/git-core"
-  if [[ "$prefix" != /tmp/curl-android-build/prefix-* ]]; then
-    build_zlib "$prefix"
-    build_openssl "$prefix"
+  if [[ "$LINK_MODE" == "dynamic" ]]; then
+    prefix="${DEPS_PREFIX:-$REPO_ROOT/common/deps/out/$ABI}"
+    if [[ ! -e "$prefix/lib/libcurl.so" && ! -e "$prefix/lib/libcurl.so.4" ]]; then
+      echo "ERROR: shared deps missing at $prefix (run ./common/deps/build.sh $name)"
+      exit 1
+    fi
+    log "Using shared deps: $prefix"
+    rpath_flag=""
+    curl_libs="-L${prefix}/lib -lcurl -lssl -lcrypto -lz -ldl"
+    ext_libs="-lssl -lcrypto -lz -ldl -lm"
+  else
+    prefix="$BUILD_ROOT/prefix-$ABI"
+    if [[ -f /tmp/curl-android-build/prefix-$ABI/lib/libssl.a ]]; then
+      prefix="/tmp/curl-android-build/prefix-$ABI"
+      log "Reusing deps prefix: $prefix"
+    fi
+    mkdir -p "$prefix"
+    if [[ "$prefix" != /tmp/curl-android-build/prefix-* ]]; then
+      build_zlib "$prefix"
+      build_openssl "$prefix"
+    fi
+    build_libcurl "$prefix"
+    curl_libs="${prefix}/lib/libcurl.a ${prefix}/lib/libssl.a ${prefix}/lib/libcrypto.a ${prefix}/lib/libz.a -ldl"
+    ext_libs="${prefix}/lib/libssl.a ${prefix}/lib/libcrypto.a ${prefix}/lib/libz.a -ldl -lm"
   fi
-  build_libcurl "$prefix"
 
-  log "Building git ${GIT_VER} for $ABI (API $API)"
+  mkdir -p "$dest/bin" "$dest/libexec/git-core"
+  log "Building git ${GIT_VER} for $ABI (API $API) LINK_MODE=$LINK_MODE"
   rm -rf "$bdir"
   cp -a "$BUILD_ROOT/git-${GIT_VER}" "$bdir"
   cd "$bdir"
@@ -268,7 +287,7 @@ AR = llvm-ar
 RANLIB = llvm-ranlib
 STRIP = llvm-strip
 CFLAGS = -O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix}/include -include ${compat_h}
-LDFLAGS = -pie -L${prefix}/lib
+LDFLAGS = -pie -L${prefix}/lib ${rpath_flag}
 ARFLAGS = rc
 
 NO_GETTEXT = YesPlease
@@ -285,9 +304,9 @@ CURLDIR = ${prefix}
 CURL_CONFIG = /bin/false
 CURL_CFLAGS = -I${prefix}/include
 CURL_LDFLAGS =
-override CURL_LIBCURL = ${prefix}/lib/libcurl.a ${prefix}/lib/libssl.a ${prefix}/lib/libcrypto.a ${prefix}/lib/libz.a -ldl
+override CURL_LIBCURL = ${curl_libs}
 OPENSSL_LINK =
-EXTLIBS = ${prefix}/lib/libssl.a ${prefix}/lib/libcrypto.a ${prefix}/lib/libz.a -ldl -lm
+EXTLIBS = ${ext_libs}
 
 prefix = /data/local/tmp/git
 EOF
@@ -331,13 +350,39 @@ EOF
     ln -sfn git-remote-http git-remote-ftps
   )
 
+  if [[ "$LINK_MODE" == "dynamic" ]]; then
+    mkdir -p "$dest/lib"
+    local f
+    for f in "$prefix"/lib/libz.so* "$prefix"/lib/libssl.so* "$prefix"/lib/libcrypto.so* "$prefix"/lib/libcurl.so*; do
+      [[ -e "$f" ]] || continue
+      cp -a "$f" "$dest/lib/"
+    done
+    for f in "$dest"/lib/*.so*; do
+      [[ -f "$f" && ! -L "$f" ]] || continue
+      llvm-strip -s "$f" 2>/dev/null || true
+    done
+    # shellcheck source=../common/set-rpath.sh
+    source "$REPO_ROOT/common/set-rpath.sh"
+    local b
+    for b in "$dest"/bin/*; do
+      [[ -f "$b" && ! -L "$b" ]] || continue
+      set_rpath '$ORIGIN/../lib' "$b"
+    done
+    for b in "$dest"/libexec/git-core/*; do
+      [[ -f "$b" && ! -L "$b" ]] || continue
+      set_rpath '$ORIGIN/../../lib' "$b"
+    done
+    set_rpath '$ORIGIN' "$dest"/lib/libcurl.so* "$dest"/lib/libssl.so* "$dest"/lib/libcrypto.so* 2>/dev/null || true
+  fi
+
   {
     echo "git ${GIT_VER}"
     echo "ABI: $ABI"
     echo "API: $API"
     echo "NDK: $(grep Pkg.Revision "$NDK/source.properties" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
     echo "source: official kernel.org git"
-    echo "HTTPS: libcurl ${CURL_VER} + OpenSSL ${OPENSSL_VER} + zlib ${ZLIB_VER} (static)"
+    echo "HTTPS: libcurl ${CURL_VER} + OpenSSL ${OPENSSL_VER} + zlib ${ZLIB_VER} (${LINK_MODE})"
+    echo "link_mode: ${LINK_MODE}"
     echo "link: dynamic PIE (bionic)"
     echo "NO_GETTEXT/NO_PERL/NO_PYTHON/NO_ICONV/NO_EXPAT"
     echo "compat: pthread_setcancelstate stub; no sync_file_range (API < 26)"
@@ -375,7 +420,7 @@ main() {
   mapfile -t targets < <(expand_targets "$@")
   [[ ${#targets[@]} -eq 0 ]] && targets=(arm64)
   log "Targets: ${targets[*]}"
-  log "git=${GIT_VER} curl=${CURL_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API}"
+  log "git=${GIT_VER} curl=${CURL_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API} LINK_MODE=${LINK_MODE}"
   local t
   for t in "${targets[@]}"; do build_one "$t"; done
   log "Done. Binaries under: $OUT_DIR"

@@ -24,7 +24,9 @@
 │       ├── out/<abi>/…        # gitignore
 │       └── README.md
 ├── common/
-│   └── env-ndk.sh             # 各包共用的 NDK 环境
+│   ├── env-ndk.sh             # 各包共用的 NDK 环境
+│   └── deps/                  # 共享 .so（zlib/openssl/libcurl）
+├── build-all-dynamic.sh       # 动态链接一键编 curl+openssh+git
 ├── .github/workflows/
 │   ├── build-bash.yml
 │   └── build-jdk17.yml
@@ -68,6 +70,30 @@ echo $NDK
 | [openssh](openssh/) | 官方 OpenSSH portable（ssh/sshd） | `./openssh/build.sh arm64` | [Build Android OpenSSH](.github/workflows/build-openssh.yml) |
 | [git](git/) | 官方 git（HTTPS via 静态 libcurl/OpenSSL） | `./git/build.sh arm64` | [Build Android git](.github/workflows/build-git.yml) |
 | [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
+
+
+## 动态链接模式（共享 OpenSSL / libcurl）
+
+默认各包仍是 **静态嵌入** 依赖（单文件推送）。若要共享 `.so`、减小体积：
+
+```bash
+# 1) 编共享库
+./common/deps/build.sh arm64
+
+# 2) 各包动态链接（或一键）
+LINK_MODE=dynamic ./curl/build.sh arm64
+LINK_MODE=dynamic ./openssh/build.sh arm64
+LINK_MODE=dynamic ./git/build.sh arm64
+# 等价于：
+./build-all-dynamic.sh arm64
+```
+
+CI：Actions → **Build all dynamic**（产出 `android-dynamic-<abi>.tar.gz`）。
+
+| 模式 | 体积 | 推送 |
+|------|------|------|
+| static（默认） | 大（OpenSSL 打进每个二进制） | 单文件即可 |
+| dynamic | 小（`.so` 共享） | 需带 `lib/` 目录 |
 
 ## 快速开始
 

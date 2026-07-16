@@ -32,7 +32,9 @@ API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 JOBS="$(nproc 2>/dev/null || echo 2)"
-PREFIX_SHARED="${PREFIX_SHARED:-}"  # optional: reuse curl's prefix
+PREFIX_SHARED="${PREFIX_SHARED:-}"  # optional: reuse curl's static prefix
+LINK_MODE="${LINK_MODE:-static}"    # static|dynamic
+DEPS_PREFIX="${DEPS_PREFIX:-}"      # dynamic: common/deps/out/<ABI>
 
 if [[ -z "${NDK:-}" ]]; then
   for cand in \
@@ -223,25 +225,39 @@ build_one() {
   local name="$1"
   resolve_abi "$name"
 
-  local prefix="${PREFIX_SHARED:-$BUILD_ROOT/prefix-$ABI}"
-  # Reuse curl prefix if present and matching
-  if [[ -z "${PREFIX_SHARED}" && -f /tmp/curl-android-build/prefix-$ABI/lib/libssl.a ]]; then
-    prefix="/tmp/curl-android-build/prefix-$ABI"
-    log "Reusing OpenSSL/zlib prefix: $prefix"
-  fi
-
+  local prefix
   local src="$BUILD_ROOT/openssh-${OPENSSH_VER}"
   local bdir="$BUILD_ROOT/build-$ABI"
   local dest="$OUT_DIR/$ABI"
   local cc="${CLANG_PREFIX}${API}-clang"
+  local rpath_flag=""  # set via patchelf post-link
 
-  mkdir -p "$prefix" "$dest"
-  if [[ "$prefix" != /tmp/curl-android-build/prefix-* ]]; then
-    build_zlib "$prefix"
-    build_openssl "$prefix"
+  if [[ "$LINK_MODE" == "dynamic" ]]; then
+    prefix="${DEPS_PREFIX:-$REPO_ROOT/common/deps/out/$ABI}"
+    if [[ ! -e "$prefix/lib/libssl.so" && ! -e "$prefix/lib/libssl.so.3" ]]; then
+      echo "ERROR: shared deps missing at $prefix (run ./common/deps/build.sh $name)"
+      exit 1
+    fi
+    log "Using shared deps: $prefix"
+    rpath_flag=""
+  else
+    prefix="${PREFIX_SHARED:-$BUILD_ROOT/prefix-$ABI}"
+    if [[ -z "${PREFIX_SHARED}" && -f /tmp/curl-android-build/prefix-$ABI/lib/libssl.a ]]; then
+      prefix="/tmp/curl-android-build/prefix-$ABI"
+      log "Reusing OpenSSL/zlib prefix: $prefix"
+    fi
   fi
 
-  log "Building OpenSSH ${OPENSSH_VER} for $ABI (API $API)"
+  mkdir -p "$dest"
+  if [[ "$LINK_MODE" != "dynamic" ]]; then
+    mkdir -p "$prefix"
+    if [[ "$prefix" != /tmp/curl-android-build/prefix-* ]]; then
+      build_zlib "$prefix"
+      build_openssl "$prefix"
+    fi
+  fi
+
+  log "Building OpenSSH ${OPENSSH_VER} for $ABI (API $API) LINK_MODE=$LINK_MODE"
   rm -rf "$bdir"
   mkdir -p "$bdir"
   cd "$bdir"
@@ -250,7 +266,7 @@ build_one() {
   export AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix}/include"
   export CPPFLAGS="-I${prefix}/include"
-  export LDFLAGS="-pie -L${prefix}/lib"
+  export LDFLAGS="-pie -L${prefix}/lib ${rpath_flag}"
   export LIBS="-lssl -lcrypto -lz"
 
   "$src/configure" \
@@ -310,15 +326,37 @@ build_one() {
   done
   [[ -f "$dest/ssh" ]] || { echo "ERROR: ssh binary missing"; exit 1; }
 
+  if [[ "$LINK_MODE" == "dynamic" ]]; then
+    mkdir -p "$dest/lib"
+    local f
+    for f in "$prefix"/lib/libz.so* "$prefix"/lib/libssl.so* "$prefix"/lib/libcrypto.so*; do
+      [[ -e "$f" ]] || continue
+      cp -a "$f" "$dest/lib/"
+    done
+    for f in "$dest"/lib/*.so*; do
+      [[ -f "$f" && ! -L "$f" ]] || continue
+      llvm-strip -s "$f" 2>/dev/null || true
+    done
+    # shellcheck source=../common/set-rpath.sh
+    source "$REPO_ROOT/common/set-rpath.sh"
+    local b
+    for b in "$dest"/ssh "$dest"/scp "$dest"/sftp "$dest"/sshd "$dest"/ssh-keygen              "$dest"/ssh-add "$dest"/ssh-agent "$dest"/ssh-keyscan              "$dest"/sftp-server "$dest"/ssh-keysign "$dest"/sshd-session; do
+      [[ -f "$b" ]] || continue
+      set_rpath '$ORIGIN/lib' "$b"
+    done
+    set_rpath '$ORIGIN' "$dest"/lib/libssl.so* "$dest"/lib/libcrypto.so* 2>/dev/null || true
+  fi
+
   {
     echo "OpenSSH ${OPENSSH_VER} (portable)"
     echo "ABI: $ABI"
     echo "API: $API"
     echo "NDK: $(grep Pkg.Revision "$NDK/source.properties" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
     echo "source: official OpenBSD portable"
-    echo "TLS: OpenSSL ${OPENSSL_VER} (static)"
-    echo "zlib: ${ZLIB_VER} (static)"
-    echo "link: dynamic PIE (bionic) + static ssl/crypto/z"
+    echo "TLS: OpenSSL ${OPENSSL_VER} (${LINK_MODE})"
+    echo "zlib: ${ZLIB_VER} (${LINK_MODE})"
+    echo "link_mode: ${LINK_MODE}"
+    echo "link: dynamic PIE (bionic) + ${LINK_MODE} ssl/crypto/z"
     echo "sandbox: none"
     file "$dest/ssh"
     ls -lh "$dest"
@@ -350,7 +388,7 @@ main() {
   mapfile -t targets < <(expand_targets "$@")
   [[ ${#targets[@]} -eq 0 ]] && targets=(arm64)
   log "Targets: ${targets[*]}"
-  log "openssh=${OPENSSH_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API}"
+  log "openssh=${OPENSSH_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API} LINK_MODE=${LINK_MODE}"
   local t
   for t in "${targets[@]}"; do build_one "$t"; done
   log "Done. Binaries under: $OUT_DIR"

@@ -21,8 +21,11 @@
 #
 # Notes:
 #   - curl is dynamic PIE against Bionic only (libc / libdl / libm).
-#   - OpenSSL + zlib are built static and linked into curl (single-file push).
+#   - LINK_MODE=static (default): OpenSSL+zlib static into curl (single-file).
+#   - LINK_MODE=dynamic: link against shared libs from common/deps (DEPS_PREFIX).
 #   - Fully static curl aborts on modern arm64 Bionic (TLS underalignment).
+#   LINK_MODE=dynamic ./curl/build.sh arm64
+#   DEPS_PREFIX=$PWD/common/deps/out/arm64-v8a LINK_MODE=dynamic ./curl/build.sh arm64
 
 set -euo pipefail
 
@@ -35,6 +38,8 @@ API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 JOBS="$(nproc 2>/dev/null || echo 2)"
+LINK_MODE="${LINK_MODE:-static}"   # static|dynamic
+DEPS_PREFIX="${DEPS_PREFIX:-}"     # for dynamic: common/deps/out/<ABI>
 
 if [[ -z "${NDK:-}" ]]; then
   for cand in \
@@ -368,18 +373,134 @@ build_curl() {
   log "OK -> $dest/curl"
 }
 
+
+build_curl_dynamic() {
+  local prefix="$1"
+  local dest="$2"
+  local src="$BUILD_ROOT/curl-${CURL_VER}"
+  local bdir="$BUILD_ROOT/curl-dyn-build-$ABI"
+
+  rm -rf "$bdir"
+  mkdir -p "$bdir" "$dest/lib"
+  cd "$bdir"
+
+  set_cross_env
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix}/include"
+  export CPPFLAGS="-I${prefix}/include"
+  export LDFLAGS="-pie -L${prefix}/lib"
+  export LIBS="-lcurl -lssl -lcrypto -lz"
+  export PKG_CONFIG_PATH="${prefix}/lib/pkgconfig"
+  export PKG_CONFIG_LIBDIR="${prefix}/lib/pkgconfig"
+  export PKG_CONFIG_SYSROOT_DIR=
+
+  log "Configuring curl ${CURL_VER} DYNAMIC against $prefix"
+  "$src/configure" \
+    --host="${TRIPLE}" \
+    --build="$(uname -m)-pc-linux-gnu" \
+    --prefix="/data/local/tmp/curl" \
+    --with-ssl="${prefix}" \
+    --with-zlib="${prefix}" \
+    --enable-shared \
+    --disable-static \
+    --enable-ipv6 \
+    --enable-threaded-resolver \
+    --disable-ldap --disable-ldaps --disable-rtsp --disable-dict \
+    --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
+    --disable-smb --disable-smtp --disable-gopher --disable-mqtt \
+    --disable-manual --disable-docs \
+    --without-libpsl --without-brotli --without-zstd \
+    --without-libidn2 --without-libssh2 --without-nghttp2 \
+    --without-nghttp3 --without-ngtcp2 --without-librtmp \
+    --without-ca-bundle --without-ca-path --with-ca-fallback \
+    >configure.log 2>&1 || {
+      echo "ERROR: curl configure (dynamic) failed"; tail -60 configure.log; exit 1
+    }
+
+  make -j"$JOBS" >make.log 2>&1 || {
+    echo "ERROR: curl make (dynamic) failed"; grep -iE 'error:|undefined' make.log | tail -40; exit 1
+  }
+
+  local bin=""
+  # libtool may leave a shell wrapper at src/curl; real ELF is src/.libs/curl
+  if [[ -f src/.libs/curl ]]; then bin=src/.libs/curl
+  elif [[ -f src/curl ]] && file src/curl | grep -q 'ELF'; then bin=src/curl
+  elif [[ -f .libs/curl ]]; then bin=.libs/curl
+  elif [[ -f curl ]] && file curl | grep -q 'ELF'; then bin=curl
+  else echo "ERROR: curl ELF binary missing"; find . -name curl -type f | head; exit 1
+  fi
+
+  if file "$bin" | grep -q 'statically linked'; then
+    echo "ERROR: unexpected fully static binary in dynamic mode"
+    exit 1
+  fi
+
+  cp -f "$bin" "$dest/curl.unstripped"
+  llvm-strip -s -o "$dest/curl" "$bin"
+  chmod 755 "$dest/curl"
+
+  mkdir -p "$dest/lib"
+  local f
+  for f in "$prefix"/lib/libz.so* "$prefix"/lib/libssl.so* "$prefix"/lib/libcrypto.so* "$prefix"/lib/libcurl.so*; do
+    [[ -e "$f" ]] || continue
+    cp -a "$f" "$dest/lib/"
+  done
+  for f in "$dest"/lib/*.so*; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    llvm-strip -s "$f" 2>/dev/null || true
+  done
+  # shellcheck source=../common/set-rpath.sh
+  source "$REPO_ROOT/common/set-rpath.sh"
+  set_rpath '$ORIGIN/lib' "$dest/curl"
+  set_rpath '$ORIGIN' "$dest"/lib/libcurl.so* "$dest"/lib/libssl.so* "$dest"/lib/libcrypto.so* 2>/dev/null || true
+
+  {
+    echo "curl ${CURL_VER}"
+    echo "ABI: $ABI"
+    echo "API: $API"
+    echo "NDK: $(grep Pkg.Revision "$NDK/source.properties" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
+    echo "source: official curl.se + openssl.org + zlib"
+    echo "link_mode: dynamic"
+    echo "TLS: OpenSSL ${OPENSSL_VER} (shared)"
+    echo "zlib: ${ZLIB_VER} (shared)"
+    echo "libcurl: shared"
+    echo "rpath: \$ORIGIN/lib"
+    file "$dest/curl"
+    ls -lh "$dest/curl"
+    echo "--- needed libs ---"
+    llvm-readobj --needed-libs "$dest/curl" 2>/dev/null || true
+    echo "--- staged libs ---"
+    ls -lh "$dest/lib"
+  } | tee "$dest/BUILD_INFO.txt"
+
+  log "OK (dynamic) -> $dest/curl"
+}
+
 build_one() {
   local name="$1"
   resolve_abi "$name"
 
-  local prefix="$BUILD_ROOT/prefix-$ABI"
   local dest="$OUT_DIR/$ABI"
+  local prefix
 
-  log "=== $ABI ==="
-  mkdir -p "$prefix" "$dest"
-  build_zlib "$prefix"
-  build_openssl "$prefix"
-  build_curl "$prefix" "$dest"
+  log "=== $ABI (LINK_MODE=$LINK_MODE) ==="
+  mkdir -p "$dest"
+
+  if [[ "$LINK_MODE" == "dynamic" ]]; then
+    prefix="${DEPS_PREFIX:-$REPO_ROOT/common/deps/out/$ABI}"
+    if [[ ! -e "$prefix/lib/libssl.so" && ! -e "$prefix/lib/libssl.so.3" ]]; then
+      echo "ERROR: shared deps missing at $prefix"
+      echo "Build first: ./common/deps/build.sh $name"
+      exit 1
+    fi
+    log "Using shared deps: $prefix"
+    build_curl_dynamic "$prefix" "$dest"
+  else
+    prefix="$BUILD_ROOT/prefix-$ABI"
+    mkdir -p "$prefix"
+    build_zlib "$prefix"
+    build_openssl "$prefix"
+    build_curl "$prefix" "$dest"
+  fi
 }
 
 expand_targets() {
@@ -403,7 +524,7 @@ main() {
   mapfile -t targets < <(expand_targets "$@")
   [[ ${#targets[@]} -eq 0 ]] && targets=(arm64)
   log "Targets: ${targets[*]}"
-  log "curl=${CURL_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API}"
+  log "curl=${CURL_VER} openssl=${OPENSSL_VER} zlib=${ZLIB_VER} API=${API} LINK_MODE=${LINK_MODE}"
   local t
   for t in "${targets[@]}"; do build_one "$t"; done
   log "Done. Binaries under: $OUT_DIR"

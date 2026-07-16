@@ -1,0 +1,237 @@
+# Build shared .so deps once, then curl / openssh / git with LINK_MODE=dynamic.
+# Actions → "Build all dynamic" → Run workflow
+name: Build all dynamic
+
+on:
+  workflow_dispatch:
+    inputs:
+      api:
+        description: "Min Android API level"
+        required: true
+        type: string
+        default: "24"
+      abi_arm64:
+        description: "ABI · arm64-v8a"
+        required: true
+        type: boolean
+        default: true
+      abi_arm:
+        description: "ABI · armeabi-v7a"
+        required: true
+        type: boolean
+        default: false
+      abi_x86_64:
+        description: "ABI · x86_64"
+        required: true
+        type: boolean
+        default: false
+      abi_x86:
+        description: "ABI · x86"
+        required: true
+        type: boolean
+        default: false
+      curl_version:
+        description: "curl / libcurl version"
+        required: true
+        type: string
+        default: "8.21.0"
+      openssl_version:
+        description: "OpenSSL version"
+        required: true
+        type: string
+        default: "3.3.3"
+      zlib_version:
+        description: "zlib version"
+        required: true
+        type: string
+        default: "1.3.1"
+      openssh_version:
+        description: "OpenSSH portable version"
+        required: true
+        type: string
+        default: "9.9p2"
+      git_version:
+        description: "git version"
+        required: true
+        type: string
+        default: "2.49.0"
+      ndk_version:
+        description: "NDK release"
+        required: true
+        type: string
+        default: "r27d"
+      create_release:
+        description: "Publish a release with deps + binaries"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-all-dynamic-${{ github.ref }}-${{ inputs.api }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: dynamic deps + curl/openssh/git
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      API: ${{ inputs.api }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+      OPENSSL_VER: ${{ inputs.openssl_version }}
+      ZLIB_VER: ${{ inputs.zlib_version }}
+      CURL_VER: ${{ inputs.curl_version }}
+      OPENSSH_VER: ${{ inputs.openssh_version }}
+      GIT_VER: ${{ inputs.git_version }}
+      LINK_MODE: dynamic
+      NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
+      BUILD_ROOT: ${{ github.workspace }}/.build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve ABIs
+        id: abis
+        run: |
+          set -euo pipefail
+          selected=()
+          [[ "${{ inputs.abi_arm64 }}" == "true" ]] && selected+=(arm64)
+          [[ "${{ inputs.abi_arm }}" == "true" ]] && selected+=(arm)
+          [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
+          [[ "${{ inputs.abi_x86 }}" == "true" ]] && selected+=(x86)
+          [[ ${#selected[@]} -gt 0 ]] || { echo "::error::Select an ABI"; exit 1; }
+          echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+
+      - name: Host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential perl wget curl file binutils python3 patchelf
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Download NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NDK")"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          wget -q -O "/tmp/${zip}" "https://dl.google.com/android/repository/${zip}"
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+
+      - name: Build shared deps
+        run: |
+          set -euo pipefail
+          chmod +x common/deps/build.sh
+          # shellcheck disable=SC2086
+          BUILD_ROOT="$BUILD_ROOT/deps" ./common/deps/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Build curl (dynamic)
+        run: |
+          set -euo pipefail
+          chmod +x curl/build.sh
+          # shellcheck disable=SC2086
+          BUILD_ROOT="$BUILD_ROOT/curl" LINK_MODE=dynamic ./curl/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Build openssh (dynamic)
+        run: |
+          set -euo pipefail
+          chmod +x openssh/build.sh
+          # shellcheck disable=SC2086
+          BUILD_ROOT="$BUILD_ROOT/openssh" LINK_MODE=dynamic ./openssh/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Build git (dynamic)
+        run: |
+          set -euo pipefail
+          chmod +x git/build.sh
+          # shellcheck disable=SC2086
+          BUILD_ROOT="$BUILD_ROOT/git" LINK_MODE=dynamic ./git/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Package trees
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          declare -A MAP=([arm64]=arm64-v8a [arm]=armeabi-v7a [x86_64]=x86_64 [x86]=x86)
+          for short in ${{ steps.abis.outputs.list }}; do
+            abi="${MAP[$short]}"
+            stage="dist/android-dynamic-${short}"
+            mkdir -p "$stage"/{lib,bin,openssh,git}
+            # shared libs once
+            cp -a "common/deps/out/${abi}/lib/"*.so* "$stage/lib/" 2>/dev/null || true
+            # curl
+            [[ -f "curl/out/${abi}/curl" ]] && cp -a "curl/out/${abi}/curl" "$stage/bin/curl"
+            # openssh
+            for b in ssh scp sftp sshd ssh-keygen ssh-add ssh-agent; do
+              [[ -f "openssh/out/${abi}/$b" ]] && cp -a "openssh/out/${abi}/$b" "$stage/openssh/"
+            done
+            # git
+            if [[ -d "git/out/${abi}/bin" ]]; then
+              cp -a "git/out/${abi}/bin/." "$stage/git/"
+            fi
+            # helper run script
+            cat > "$stage/env.sh" << 'ENV'
+          # source this on device, then run binaries
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/lib:${LD_LIBRARY_PATH:-}"
+          export PATH="$HERE/bin:$HERE/openssh:$HERE/git:$PATH"
+          export GIT_EXEC_PATH="$HERE/git"
+          ENV
+            # Prefer rpath; env.sh is fallback
+            if command -v patchelf >/dev/null; then
+              for f in "$stage"/bin/* "$stage"/openssh/* "$stage"/git/*; do
+                [[ -f "$f" && ! -L "$f" ]] || continue
+                file "$f" | grep -q ELF || continue
+                case "$f" in
+                  */git/*) patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true ;;
+                  *)       patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true ;;
+                esac
+              done
+              for f in "$stage"/lib/*.so*; do
+                [[ -f "$f" && ! -L "$f" ]] || continue
+                patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+              done
+            fi
+            tar -C dist -czf "dist/android-dynamic-${short}.tar.gz" "android-dynamic-${short}"
+            echo "packed android-dynamic-${short}.tar.gz"
+          done
+          ls -lh dist/*.tar.gz | tee dist/SUMMARY.txt
+          {
+            echo "Android dynamic bundle"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
+            echo "API ${API}"
+            echo "OpenSSL ${OPENSSL_VER} zlib ${ZLIB_VER} curl ${CURL_VER}"
+            echo "OpenSSH ${OPENSSH_VER} git ${GIT_VER}"
+            echo "layout: lib/*.so + bin/curl + openssh/* + git/*"
+            echo "rpath: binaries use \$ORIGIN/../lib"
+            echo "commit ${{ github.sha }}"
+          } | tee dist/RELEASE_NOTES.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-dynamic-${{ inputs.api }}
+          path: dist/**
+          retention-days: 30
+
+      - name: Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="android-dynamic-${{ inputs.api }}-$(date -u +%Y%m%d)"
+          TITLE="Android dynamic tools (API ${{ inputs.api }})"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt --latest=false
+          fi
+          gh release upload "$TAG" dist/*.tar.gz --clobber
