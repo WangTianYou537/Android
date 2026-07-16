@@ -10,7 +10,7 @@ on:
         description: "GNU coreutils version (official tarball, e.g. 9.5)"
         required: true
         type: string
-        default: "9.5"
+        default: "9.11"
       api:
         description: "Min Android API level"
         required: true

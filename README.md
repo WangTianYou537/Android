@@ -10,6 +10,7 @@
 ├── bash/                      # GNU bash 包（静态 ncurses + readline）
 ├── coreutils/                 # 官方 GNU coreutils（single-binary）
 ├── curl/                      # 官方 curl（OpenSSL 静态）
+├── openssh/                   # 官方 OpenSSH portable
 │   ├── build.sh
 │   ├── compat/android_compat.c
 │   ├── out/<abi>/…            # gitignore
@@ -63,9 +64,21 @@ echo $NDK
 | [bash](bash/) | GNU bash（动态 PIE + 静态 ncurses/readline） | `./bash/build.sh arm64` | [Build Android bash](.github/workflows/build-bash.yml) |
 | [coreutils](coreutils/) | 官方 GNU coreutils（multicall） | `./coreutils/build.sh arm64` | [Build Android coreutils](.github/workflows/build-coreutils.yml) |
 | [curl](curl/) | 官方 curl 8.x（HTTPS / OpenSSL 静态） | `./curl/build.sh arm64` | [Build Android curl](.github/workflows/build-curl.yml) |
+| [openssh](openssh/) | 官方 OpenSSH portable（ssh/sshd） | `./openssh/build.sh arm64` | [Build Android OpenSSH](.github/workflows/build-openssh.yml) |
 | [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
 
 ## 快速开始
+
+### openssh
+
+```bash
+source common/env-ndk.sh
+./openssh/build.sh arm64
+adb push openssh/out/arm64-v8a/ssh /data/local/tmp/ssh
+adb shell /data/local/tmp/ssh -V
+```
+
+详见 [openssh/README.md](openssh/README.md)。
 
 ### curl
 

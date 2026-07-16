@@ -1,0 +1,40 @@
+--- a/openbsd-compat/explicit_bzero.c	2025-02-18 16:15:08.000000000 +0800
++++ b/openbsd-compat/explicit_bzero.c	2026-07-17 04:11:43.807373890 +0800
+@@ -39,6 +39,16 @@
+  * Indirect bzero through a volatile pointer to hopefully avoid
+  * dead-store optimisation eliminating the call.
+  */
++#if defined(__ANDROID__)
++void
++explicit_bzero(void *p, size_t n)
++{
++	if (n == 0)
++		return;
++	/* Bionic provides bzero as a macro/inline; use memset for portability. */
++	memset(p, 0, n);
++}
++#else
+ static void (* volatile ssh_bzero)(void *, size_t) = bzero;
+ 
+ void
+@@ -46,19 +56,14 @@
+ {
+ 	if (n == 0)
+ 		return;
+-	/*
+-	 * clang -fsanitize=memory needs to intercept memset-like functions
+-	 * to correctly detect memory initialisation. Make sure one is called
+-	 * directly since our indirection trick above successfully confuses it.
+-	 */
+ #if defined(__has_feature)
+ # if __has_feature(memory_sanitizer)
+ 	memset(p, 0, n);
+ # endif
+ #endif
+-
+ 	ssh_bzero(p, n);
+ }
++#endif
+ 
+ #endif /* HAVE_MEMSET_S */
+ 

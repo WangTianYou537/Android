@@ -5,11 +5,11 @@
 # NOT Termux packages — only GNU upstream tarballs.
 #
 # Usage (from repo root or coreutils/):
-#   ./coreutils/build.sh                 # default arm64 API 24
+#   ./coreutils/build.sh                 # default arm64, coreutils 9.11, API 24
 #   ./coreutils/build.sh arm64
 #   ./coreutils/build.sh arm64 arm
 #   ./coreutils/build.sh all
-#   COREUTILS_VER=9.5 API=28 ./coreutils/build.sh arm64
+#   COREUTILS_VER=9.11 API=28 ./coreutils/build.sh arm64
 #   NDK=/opt/android-ndk-r27d ./coreutils/build.sh arm64
 #
 # Output:
@@ -26,7 +26,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/coreutils-android-build}"
-COREUTILS_VER="${COREUTILS_VER:-9.5}"
+COREUTILS_VER="${COREUTILS_VER:-9.11}"
 API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
@@ -100,57 +100,45 @@ apply_patches() {
   if [[ -f "$stamp" ]]; then
     return 0
   fi
+
+  # hostid declaration patch works across 9.5–9.11
   local p
-  for p in "$ROOT/patches/"*.patch; do
+  for p in "$ROOT/patches/"*gethostid*.patch; do
     [[ -f "$p" ]] || continue
-    log "Applying $(basename "$p")"
-    # Prefer git apply; fall back to patch -p1
-    if ! (cd "$src_dir" && patch -p1 --forward --dry-run < "$p" >/dev/null 2>&1); then
-      # maybe already applied
-      if grep -q 'ANDROID' "$src_dir/lib/time.in.h" 2>/dev/null && [[ "$(basename "$p")" == *timezone* ]]; then
-        log "  already applied: $(basename "$p")"
-        continue
-      fi
-      if grep -q 'ANDROID_GETHOSTID' "$src_dir/src/hostid.c" 2>/dev/null && [[ "$(basename "$p")" == *gethostid* ]]; then
-        log "  already applied: $(basename "$p")"
-        continue
-      fi
+    if grep -q 'ANDROID_GETHOSTID_DECL' "$src_dir/src/hostid.c" 2>/dev/null; then
+      log "gethostid patch already present"
+      continue
     fi
-    (cd "$src_dir" && patch -p1 --forward < "$p") || {
-      # If fuzz fails but markers present, continue
-      log "WARN: patch may already be applied: $p"
-    }
+    log "Applying $(basename "$p")"
+    (cd "$src_dir" && patch -p1 --forward < "$p") || true
   done
-  # Ensure patches via direct edit if patch tool failed
+
+  # timezone_t: only needed on older gnulib (coreutils <= 9.5) where there is a bare
+  # "typedef struct tm_zone *timezone_t" that collides with Bionic.
+  # coreutils 9.6+ / 9.11: gnulib has HAVE_TIMEZONE_T / rpl_timezone_t branching —
+  # we force that path via configure cache vars instead of patching.
+  if grep -q 'GNULIB_defined_timezone_t\|HAVE_TZALLOC\|rpl_timezone_t' "$src_dir/lib/time.in.h" 2>/dev/null; then
+    log "time.in.h: modern gnulib (9.6+) — use configure cache for timezone_t (no source patch)"
+  else
+    for p in "$ROOT/patches/"*timezone*.patch; do
+      [[ -f "$p" ]] || continue
+      if grep -q 'gl_timezone_t' "$src_dir/lib/time.in.h" 2>/dev/null; then
+        log "timezone patch already present"
+        continue
+      fi
+      log "Applying $(basename "$p") (legacy gnulib)"
+      (cd "$src_dir" && patch -p1 --forward < "$p") || true
+    done
+  fi
+
   ensure_inline_patches "$src_dir"
   touch "$stamp"
 }
 
 ensure_inline_patches() {
   local src_dir="$1"
-  # time.in.h
-  if ! grep -q 'gl_timezone_t' "$src_dir/lib/time.in.h"; then
-    python3 - "$src_dir/lib/time.in.h" << 'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-t = p.read_text()
-old = "/* Represents a time zone.\n   (timezone_t) NULL stands for UTC.  */\ntypedef struct tm_zone *timezone_t;"
-new = """/* Represents a time zone.
-   (timezone_t) NULL stands for UTC.  */
-/* ANDROID: Bionic (API < 35) typedefs an incomplete timezone_t without mktime_z.
-   Shadow it with a macro so this gnulib typedef binds to a new name. */
-#if defined __ANDROID__
-# define timezone_t gl_timezone_t
-#endif
-typedef struct tm_zone *timezone_t;"""
-if old not in t:
-    raise SystemExit(f"time.in.h pattern missing in {p}")
-p.write_text(t.replace(old, new, 1))
-print("inline-patched time.in.h")
-PY
-  fi
-  # hostid.c
+
+  # hostid.c declaration (all versions)
   if ! grep -q 'ANDROID_GETHOSTID_DECL' "$src_dir/src/hostid.c"; then
     python3 - "$src_dir/src/hostid.c" << 'PY'
 from pathlib import Path
@@ -167,6 +155,35 @@ p.write_text(t[: e + 1] + insert + t[e + 1 :])
 print("inline-patched hostid.c")
 PY
   fi
+
+  # Legacy time.in.h only (pre-9.6 style bare typedef)
+  if grep -q 'GNULIB_defined_timezone_t\|rpl_timezone_t' "$src_dir/lib/time.in.h" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q 'gl_timezone_t' "$src_dir/lib/time.in.h" 2>/dev/null; then
+    return 0
+  fi
+  python3 - "$src_dir/lib/time.in.h" << 'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = "/* Represents a time zone.\n   (timezone_t) NULL stands for UTC.  */\ntypedef struct tm_zone *timezone_t;"
+new = """/* Represents a time zone.
+   (timezone_t) NULL stands for UTC.  */
+/* ANDROID: Bionic (API < 35) typedefs an incomplete timezone_t without mktime_z.
+   Shadow it with a macro so this gnulib typedef binds to a new name. */
+#if defined __ANDROID__
+# define timezone_t gl_timezone_t
+#endif
+typedef struct tm_zone *timezone_t;"""
+if old not in t:
+    # Non-fatal for versions we don't recognize — build may still work via configure caches.
+    print(f"WARN: legacy time.in.h pattern missing in {p}; skipping shadow patch")
+    raise SystemExit(0)
+p.write_text(t.replace(old, new, 1))
+print("inline-patched time.in.h (legacy)")
+PY
 }
 
 resolve_abi() {
@@ -212,6 +229,14 @@ build_one() {
 
   "$cc" $CFLAGS -c "$compat_c" -o android_compat.o
 
+  # Bionic always has timezone_t typedef, but tzalloc/mktime_z only for API >= 35.
+  # modern gnulib (9.6+): ac_cv_type_timezone_t=yes → rpl_timezone_t + #define
+  # legacy gnulib (9.5):  ac_cv_type_timezone_t=no  + source shadow patch
+  local tz_type_cv=yes
+  if ! grep -q 'rpl_timezone_t\|GNULIB_defined_timezone_t' "$src_dir/lib/time.in.h" 2>/dev/null; then
+    tz_type_cv=no
+  fi
+
   "$src_dir/configure" \
     --host="${TRIPLE}" \
     --build="$(uname -m)-pc-linux-gnu" \
@@ -231,8 +256,13 @@ build_one() {
     ac_cv_func_malloc_0_nonnull=yes \
     ac_cv_func_realloc_0_nonnull=yes \
     ac_cv_func_calloc_0_nonnull=yes \
-    ac_cv_type_timezone_t=no \
     ac_cv_func_gethostid=yes \
+    ac_cv_type_timezone_t=${tz_type_cv} \
+    ac_cv_func_tzalloc=no \
+    ac_cv_func_tzfree=no \
+    ac_cv_func_localtime_rz=no \
+    ac_cv_func_mktime_z=no \
+
     gl_cv_func_working_mktime=yes \
     gl_cv_func_working_re_compile_pattern=yes \
     gl_cv_func_printf_directive_n=no \

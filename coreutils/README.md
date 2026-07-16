@@ -12,12 +12,12 @@
 # 仓库根目录
 source common/env-ndk.sh
 
-./coreutils/build.sh              # 默认 arm64，coreutils 9.5，API 24
+./coreutils/build.sh              # 默认 arm64，coreutils 9.11，API 24
 ./coreutils/build.sh arm64
 ./coreutils/build.sh arm64 arm
 ./coreutils/build.sh all
 
-COREUTILS_VER=9.5 API=28 ./coreutils/build.sh arm64
+COREUTILS_VER=9.11 API=28 ./coreutils/build.sh arm64
 NDK=/opt/android-ndk-r27d ./coreutils/build.sh arm64
 ```
 
@@ -54,13 +54,13 @@ adb shell /data/local/tmp/coreutils --coreutils-prog=ls -la /
 | 跳过 | pinky, users, who, stdbuf | 无用 / 需 LD_PRELOAD |
 | 无 | gmp / openssl / selinux / acl / xattr / libcap | 减少依赖，纯 Bionic |
 | 垫片 | `gethostid` | Bionic 无此符号 |
-| 补丁 | `timezone_t` shadow | API &lt; 35 的 Bionic 类型不完整 |
+| 补丁 | `timezone_t` / configure cache | 9.5 用源码 shadow；**9.6+ / 9.11** 用 gnulib `rpl_timezone_t` + cache |
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `COREUTILS_VER` | `9.5` | GNU coreutils 版本 |
+| `COREUTILS_VER` | `9.11` | GNU coreutils 版本 |
 | `API` | `24` | min Android API |
 | `NO_INSTALL_PROGRAM` | `pinky,users,who,stdbuf` | 不安装的程序列表 |
 | `BUILD_ROOT` | `/tmp/coreutils-android-build` | 构建缓存 |
@@ -72,7 +72,7 @@ adb shell /data/local/tmp/coreutils --coreutils-prog=ls -la /
 
 | 参数 | 默认 |
 |------|------|
-| `coreutils_version` | `9.5` |
+| `coreutils_version` | `9.11` |
 | `api` | `24` |
 | `abi_*` 勾选 | 全 true |
 | `ndk_version` | `r27d` |
@@ -80,8 +80,8 @@ adb shell /data/local/tmp/coreutils --coreutils-prog=ls -la /
 
 Release 资产（每个 ABI 单独一个 multicall，不打 zip）：
 
-- `coreutils-9.5-arm64`
-- `coreutils-9.5-arm`
+- `coreutils-9.11-arm64`
+- `coreutils-9.11-arm`
 - …
 
 ## 目录
