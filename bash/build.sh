@@ -2,24 +2,16 @@
 # Build GNU bash for Android (PIE, dynamically linked against Bionic)
 # WITH readline + ncurses support.
 #
-# Usage (from repo root or bash/):
-#   ./bash/build.sh                            # default: arm64 API 24
-#   ./bash/build.sh arm64
-#   ./bash/build.sh arm64 arm                  # multi-ABI
-#   ./bash/build.sh all                        # all four ABIs
-#   API=28 ./bash/build.sh arm64 arm
-#   BASH_VER=5.2.37 ./bash/build.sh all
-#   NDK=/path/to/ndk ./bash/build.sh arm64
+# Usage:
+#   ./bash/build.sh
+#   ./bash/build.sh arm64 arm
+#   ./bash/build.sh all
+#   API=28 BASH_VER=5.3 ./bash/build.sh arm64
 #
-# Why not fully static?
-#   Static arm64 binaries abort on modern Android Bionic with:
-#     "executable's TLS segment is underaligned: alignment is 8, needs to be at least 64"
-#   Link dynamically against Bionic instead (only needs system libc/libdl).
-#
-# Notes:
-#   getgrent/getpwent family is forced off (Bionic headers only declare them
-#   for API >= 26). Only group/username DB completion is lost; path/cmd Tab
-#   completion is unaffected.
+# Android notes:
+#   - Dynamic PIE (not fully static) — avoids arm64 TLS underalignment abort.
+#   - getgrent/getpwent: bash 5.3 bashline.c may call them without HAVE_* guards;
+#     we -include declarations + weak stubs for API < 26.
 
 set -euo pipefail
 
@@ -28,12 +20,8 @@ BUILD_ROOT="${BUILD_ROOT:-/tmp/bash4droid-build}"
 BASH_VER="${BASH_VER:-5.3}"
 API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
-
-# Versions of readline & ncurses to cross-compile
 READLINE_VER="${READLINE_VER:-8.3}"
 NCURSES_VER="${NCURSES_VER:-6.5}"
-
-# Package dir = bash/; repo root = parent (for shared NDK / future packages)
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 
 if [[ -z "${NDK:-}" ]]; then
@@ -54,8 +42,7 @@ if [[ -z "${NDK:-}" ]]; then
 fi
 
 if [[ -z "${NDK:-}" || ! -d "$NDK" ]]; then
-  echo "ERROR: Android NDK not found."
-  echo "Set NDK=/path/to/android-ndk-r27d or extract the zip next to this script."
+  echo "ERROR: Android NDK not found. Set NDK=/path/to/ndk"
   exit 1
 fi
 
@@ -73,10 +60,6 @@ fi
 export PATH="$TOOLCHAIN/bin:$PATH"
 
 log() { printf '==> %s\n' "$*"; }
-
-# ---------------------------------------------------------------------------
-# Source download helpers
-# ---------------------------------------------------------------------------
 
 ensure_source() {
   mkdir -p "$BUILD_ROOT"
@@ -150,11 +133,35 @@ ensure_readline() {
 }
 
 ensure_compat() {
-  mkdir -p "$ROOT/compat" "$BUILD_ROOT/compat"
-  local src="$ROOT/compat/android_compat.c"
-  if [[ ! -f "$src" ]]; then
-    cat > "$src" << 'EOF'
-/* Bionic shims: mblen is not exported from Android libc.so. */
+  mkdir -p "$ROOT/compat"
+  cat > "$ROOT/compat/android_compat.h" << 'EOF'
+/* Android Bionic shims for bash cross-build (API < 26 safe). */
+#ifndef BASH_ANDROID_COMPAT_H
+#define BASH_ANDROID_COMPAT_H
+
+#include <stddef.h>
+
+int mblen(const char *s, size_t n);
+
+#if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 26)
+
+struct group;
+struct passwd;
+
+void setgrent(void);
+void endgrent(void);
+struct group *getgrent(void);
+
+void setpwent(void);
+void endpwent(void);
+struct passwd *getpwent(void);
+
+#endif
+
+#endif
+EOF
+
+  cat > "$ROOT/compat/android_compat.c" << 'EOF'
 #include <stddef.h>
 #include <wchar.h>
 #include <string.h>
@@ -162,7 +169,7 @@ ensure_compat() {
 int mblen(const char *s, size_t n)
 {
   if (s == NULL)
-    return 0; /* always initial shift state */
+    return 0;
   if (n == 0)
     return -1;
   mbstate_t st;
@@ -172,69 +179,48 @@ int mblen(const char *s, size_t n)
     return -1;
   return (int)r;
 }
-EOF
-  fi
-}
 
-# ---------------------------------------------------------------------------
-# ABI resolution
-# ---------------------------------------------------------------------------
+#if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 26)
+
+struct group;
+struct passwd;
+
+__attribute__((weak)) void setgrent(void) {}
+__attribute__((weak)) void endgrent(void) {}
+__attribute__((weak)) struct group *getgrent(void) { return NULL; }
+
+__attribute__((weak)) void setpwent(void) {}
+__attribute__((weak)) void endpwent(void) {}
+__attribute__((weak)) struct passwd *getpwent(void) { return NULL; }
+
+#endif
+EOF
+}
 
 resolve_abi() {
   case "$1" in
     arm64|aarch64|arm64-v8a)
-      ABI=arm64-v8a
-      TRIPLE=aarch64-linux-android
-      CLANG_PREFIX=aarch64-linux-android
-      ;;
+      ABI=arm64-v8a; TRIPLE=aarch64-linux-android; CLANG_PREFIX=aarch64-linux-android ;;
     arm|armeabi-v7a|armv7)
-      ABI=armeabi-v7a
-      TRIPLE=armv7a-linux-androideabi
-      CLANG_PREFIX=armv7a-linux-androideabi
-      ;;
+      ABI=armeabi-v7a; TRIPLE=armv7a-linux-androideabi; CLANG_PREFIX=armv7a-linux-androideabi ;;
     x86_64|x64)
-      ABI=x86_64
-      TRIPLE=x86_64-linux-android
-      CLANG_PREFIX=x86_64-linux-android
-      ;;
+      ABI=x86_64; TRIPLE=x86_64-linux-android; CLANG_PREFIX=x86_64-linux-android ;;
     x86|i686)
-      ABI=x86
-      TRIPLE=i686-linux-android
-      CLANG_PREFIX=i686-linux-android
-      ;;
+      ABI=x86; TRIPLE=i686-linux-android; CLANG_PREFIX=i686-linux-android ;;
     *)
-      echo "Unknown ABI: $1"
-      echo "Supported: arm64, arm, x86_64, x86, all"
-      echo "Multiple ABIs: ./bash/build.sh arm64 arm x86_64"
-      exit 1
-      ;;
+      echo "Unknown ABI: $1 (arm64|arm|x86_64|x86|all)"; exit 1 ;;
   esac
 }
-
-# ---------------------------------------------------------------------------
-# Android: disable passwd/group iteration (needs API 26+)
-# Critical: must #undef at END of config.h so it wins over earlier #define.
-# CFLAGS -U is NOT enough — config.h re-#defines after command-line -U.
-# ---------------------------------------------------------------------------
 
 android_disable_grent_pwent() {
   local cfg="$1"
   [[ -f "$cfg" ]] || { echo "ERROR: $cfg missing after configure"; exit 1; }
-
-  # Drop any previous injection (reconfigure / retry safe)
   if grep -q 'ANDROID_DISABLE_GRENT_PWENT' "$cfg"; then
-    # delete from marker to EOF
     sed -i '/ANDROID_DISABLE_GRENT_PWENT/,$d' "$cfg"
   fi
-
   cat >> "$cfg" << 'EOF'
 
-/* ANDROID_DISABLE_GRENT_PWENT
- * Bionic only declares getgrent/getpwent family for API >= 26.
- * Configure link-tests may still set HAVE_*=1; force them off so
- * bashline.c group/user DB completion is not compiled.
- * Path / command / variable Tab completion is unaffected.
- */
+/* ANDROID_DISABLE_GRENT_PWENT */
 #undef HAVE_GETGRENT
 #undef HAVE_SETGRENT
 #undef HAVE_ENDGRENT
@@ -244,137 +230,63 @@ android_disable_grent_pwent() {
 #undef HAVE_GETGRENT_R
 #undef HAVE_GETPWENT_R
 EOF
-
   log "config.h: forced #undef of getgrent/getpwent family"
-  grep -nE 'HAVE_(GET|SET|END)(GR|PW)ENT' "$cfg" | tail -20 || true
 }
-
-# ---------------------------------------------------------------------------
-# Cross-compile ncurses for one ABI
-# ---------------------------------------------------------------------------
 
 build_ncurses() {
   local ncurses_build="$BUILD_ROOT/ncurses-build-$ABI"
   local ncurses_prefix="$BUILD_ROOT/prefix-$ABI"
-
   if [[ -f "$ncurses_prefix/lib/libncursesw.a" ]]; then
-    log "ncurses already built for $ABI, skipping"
-    return
+    log "ncurses already built for $ABI, skipping"; return
   fi
-
   log "Building ncurses ${NCURSES_VER} for $ABI"
-  rm -rf "$ncurses_build"
-  mkdir -p "$ncurses_build"
-  cd "$ncurses_build"
-
+  rm -rf "$ncurses_build"; mkdir -p "$ncurses_build"; cd "$ncurses_build"
   export CC="${CLANG_PREFIX}${API}-clang"
   export CXX="${CLANG_PREFIX}${API}-clang++"
-  export AR=llvm-ar
-  export RANLIB=llvm-ranlib
-  export STRIP=llvm-strip
+  export AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID"
   export LDFLAGS="-pie"
   unset LIBS CPPFLAGS PKG_CONFIG_PATH || true
-
   "$BUILD_ROOT/ncurses-${NCURSES_VER}/configure" \
-    --host="${TRIPLE}" \
-    --build="$(uname -m)-pc-linux-gnu" \
+    --host="${TRIPLE}" --build="$(uname -m)-pc-linux-gnu" \
     --prefix="$ncurses_prefix" \
-    --with-shared \
-    --with-normal \
-    --with-termlib \
-    --enable-widec \
-    --enable-pc-files \
-    --disable-database \
-    --disable-home-terminfo \
+    --with-shared --with-normal --with-termlib --enable-widec --enable-pc-files \
+    --disable-database --disable-home-terminfo \
     --with-fallbacks="xterm,xterm-256color,linux,vt100,screen,screen-256color,tmux,tmux-256color" \
-    --without-debug \
-    --without-tests \
-    --without-progs \
-    --without-cxx-binding \
-    --without-ada \
-    --without-manpages \
-    --without-cxx \
-    --enable-overwrite \
-    >configure.log 2>&1 || {
-      echo "ERROR: ncurses configure failed. See $ncurses_build/configure.log"
-      tail -30 configure.log
-      exit 1
-    }
-
-  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)" >make.log 2>&1 || {
-    echo "ERROR: ncurses make failed. See $ncurses_build/make.log"
-    grep -iE 'error:|undefined' make.log | tail -20
-    exit 1
-  }
-
-  make install >install.log 2>&1 || {
-    echo "ERROR: ncurses make install failed. See $ncurses_build/install.log"
-    exit 1
-  }
-
+    --without-debug --without-tests --without-progs --without-cxx-binding \
+    --without-ada --without-manpages --without-cxx --enable-overwrite \
+    >configure.log 2>&1 || { echo "ERROR: ncurses configure"; tail -30 configure.log; exit 1; }
+  make -j"$(nproc 2>/dev/null || echo 2)" >make.log 2>&1 || {
+    echo "ERROR: ncurses make"; grep -iE 'error:|undefined' make.log | tail -20; exit 1; }
+  make install >install.log 2>&1 || { echo "ERROR: ncurses install"; exit 1; }
   log "ncurses OK -> $ncurses_prefix"
 }
-
-# ---------------------------------------------------------------------------
-# Cross-compile readline for one ABI (static lib, linked into bash)
-# ---------------------------------------------------------------------------
 
 build_readline() {
   local rl_build="$BUILD_ROOT/readline-build-$ABI"
   local ncurses_prefix="$BUILD_ROOT/prefix-$ABI"
   local rl_prefix="$BUILD_ROOT/prefix-$ABI"
-
   if [[ -f "$rl_prefix/lib/libreadline.a" ]]; then
-    log "readline already built for $ABI, skipping"
-    return
+    log "readline already built for $ABI, skipping"; return
   fi
-
   log "Building readline ${READLINE_VER} for $ABI"
-  rm -rf "$rl_build"
-  mkdir -p "$rl_build"
-  cd "$rl_build"
-
+  rm -rf "$rl_build"; mkdir -p "$rl_build"; cd "$rl_build"
   export CC="${CLANG_PREFIX}${API}-clang"
   export CXX="${CLANG_PREFIX}${API}-clang++"
-  export AR=llvm-ar
-  export RANLIB=llvm-ranlib
-  export STRIP=llvm-strip
+  export AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID -I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
   export LDFLAGS="-L${ncurses_prefix}/lib"
   export CPPFLAGS="-I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
   unset LIBS PKG_CONFIG_PATH || true
-
   "$BUILD_ROOT/readline-${READLINE_VER}/configure" \
-    --host="${TRIPLE}" \
-    --build="$(uname -m)-pc-linux-gnu" \
-    --prefix="$rl_prefix" \
-    --enable-static \
-    --disable-shared \
-    --with-curses \
-    >configure.log 2>&1 || {
-      echo "ERROR: readline configure failed. See $rl_build/configure.log"
-      tail -30 configure.log
-      exit 1
-    }
-
-  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)" >make.log 2>&1 || {
-    echo "ERROR: readline make failed. See $rl_build/make.log"
-    grep -iE 'error:|undefined' make.log | tail -20
-    exit 1
-  }
-
-  make install >install.log 2>&1 || {
-    echo "ERROR: readline make install failed. See $rl_build/install.log"
-    exit 1
-  }
-
+    --host="${TRIPLE}" --build="$(uname -m)-pc-linux-gnu" \
+    --prefix="$rl_prefix" --enable-static --disable-shared --with-curses \
+    >configure.log 2>&1 || { echo "ERROR: readline configure"; tail -30 configure.log; exit 1; }
+  make -j"$(nproc 2>/dev/null || echo 2)" >make.log 2>&1 || {
+    echo "ERROR: readline make"; grep -iE 'error:|undefined' make.log | tail -20; exit 1; }
+  make install >install.log 2>&1 || { echo "ERROR: readline install"; exit 1; }
   log "readline OK -> $rl_prefix"
 }
-
-# ---------------------------------------------------------------------------
-# Build bash for one ABI
-# ---------------------------------------------------------------------------
 
 build_one() {
   local name="$1"
@@ -384,8 +296,9 @@ build_one() {
   local dest="$OUT_DIR/$ABI"
   local cc="${CLANG_PREFIX}${API}-clang"
   local prefix_dir="$BUILD_ROOT/prefix-$ABI"
+  local compat_h="$ROOT/compat/android_compat.h"
+  local compat_c="$ROOT/compat/android_compat.c"
 
-  # 1. Build ncurses & readline for this ABI (idempotent)
   build_ncurses
   build_readline
 
@@ -399,26 +312,18 @@ build_one() {
 
   export CC="$cc"
   export CXX="${CLANG_PREFIX}${API}-clang++"
-  export AR=llvm-ar
-  export RANLIB=llvm-ranlib
-  export STRIP=llvm-strip
-  # Dynamic PIE against Bionic — avoids arm64 static TLS underalignment abort.
-  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
-  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
+  export AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip
+  # -include forces getgrent decls into every TU (bash 5.3 bashline.c needs this)
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -include ${compat_h}"
+  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -include ${compat_h}"
   export LDFLAGS="-pie -L${prefix_dir}/lib"
   export LIBS="-lreadline -lncursesw -ltinfow"
   export PKG_CONFIG_PATH="${prefix_dir}/lib/pkgconfig"
 
-  # Also pre-seed autoconf cache (belt); real fix is config.h #undef below.
-  export ac_cv_func_getgrent=no
-  export ac_cv_func_setgrent=no
-  export ac_cv_func_endgrent=no
-  export ac_cv_func_getpwent=no
-  export ac_cv_func_setpwent=no
-  export ac_cv_func_endpwent=no
+  export ac_cv_func_getgrent=no ac_cv_func_setgrent=no ac_cv_func_endgrent=no
+  export ac_cv_func_getpwent=no ac_cv_func_setpwent=no ac_cv_func_endpwent=no
 
-  # Cross-compile mblen shim
-  "$CC" $CFLAGS -c "$ROOT/compat/android_compat.c" -o android_compat.o
+  "$CC" $CFLAGS -c "$compat_c" -o android_compat.o
 
   "$BUILD_ROOT/bash-${BASH_VER}/configure" \
     --host="${TRIPLE}" \
@@ -458,13 +363,10 @@ build_one() {
       exit 1
     }
 
-  # **** 真正生效的修复：config.h 末尾强制 #undef ****
   android_disable_grent_pwent "$build_dir/config.h"
 
-  # -rdynamic is useless on Android; drop it
   sed -i 's/^LOCAL_LDFLAGS = -rdynamic/LOCAL_LDFLAGS = /' Makefile
 
-  # Inject compat object into OBJECTS (tab-separated in bash Makefile)
   python3 - << 'PY'
 from pathlib import Path
 import re
@@ -493,7 +395,6 @@ PY
     echo "ERROR: bash binary not produced. See $build_dir/make.log"
     exit 1
   fi
-
   if file bash | grep -q 'statically linked'; then
     echo "ERROR: got a static binary; Android arm64 will abort with TLS underalignment."
     exit 1
@@ -503,7 +404,6 @@ PY
   llvm-strip -s -o "$dest/bash" bash
   chmod 755 "$dest/bash"
 
-  # Copy terminfo database for on-device use
   if [[ -d "$prefix_dir/share/terminfo" ]]; then
     cp -a "$prefix_dir/share/terminfo" "$dest/terminfo"
   fi
@@ -514,11 +414,10 @@ PY
     echo "API: $API"
     echo "NDK: $(grep Pkg.Revision "$NDK/source.properties" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
     echo "link: dynamic PIE (bionic)"
-    echo "static: no"
     echo "readline: yes (${READLINE_VER})"
     echo "ncurses: yes (${NCURSES_VER}, wide-char)"
-    echo "compat: mblen via android_compat.o"
-    echo "getgrent/getpwent: disabled (config.h #undef, Android API < 26 safe)"
+    echo "compat: mblen + weak getgrent/getpwent stubs (API < 26)"
+    echo "getgrent/getpwent: stubbed (group/user DB completion empty)"
     file "$dest/bash"
     ls -lh "$dest/bash"
     echo "--- needed libs ---"
@@ -530,39 +429,20 @@ PY
   log "OK -> $dest/bash"
 }
 
-# ---------------------------------------------------------------------------
-# Expand "all" / dedupe while preserving order
-# ---------------------------------------------------------------------------
-
 expand_targets() {
-  local -a raw=("$@")
-  local -a out=()
-  local t a
-  if [[ ${#raw[@]} -eq 0 ]]; then
-    raw=(arm64)
-  fi
+  local -a raw=("$@") out=() t a
+  [[ ${#raw[@]} -eq 0 ]] && raw=(arm64)
   for t in "${raw[@]}"; do
-    if [[ "$t" == "all" ]]; then
-      out+=(arm64 arm x86_64 x86)
-    else
-      out+=("$t")
-    fi
+    if [[ "$t" == "all" ]]; then out+=(arm64 arm x86_64 x86); else out+=("$t"); fi
   done
-  # dedupe
   local -a uniq=()
   for a in "${out[@]}"; do
     local seen=0
-    for u in "${uniq[@]+"${uniq[@]}"}"; do
-      [[ "$u" == "$a" ]] && { seen=1; break; }
-    done
+    for u in "${uniq[@]+"${uniq[@]}"}"; do [[ "$u" == "$a" ]] && { seen=1; break; }; done
     [[ $seen -eq 0 ]] && uniq+=("$a")
   done
   printf '%s\n' "${uniq[@]}"
 }
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 main() {
   ensure_source
@@ -572,16 +452,12 @@ main() {
 
   local -a targets
   mapfile -t targets < <(expand_targets "$@")
-  if [[ ${#targets[@]} -eq 0 ]]; then
-    targets=(arm64)
-  fi
+  [[ ${#targets[@]} -eq 0 ]] && targets=(arm64)
 
   log "Targets: ${targets[*]}"
   log "bash=${BASH_VER} readline=${READLINE_VER} ncurses=${NCURSES_VER} api=${API}"
   local t
-  for t in "${targets[@]}"; do
-    build_one "$t"
-  done
+  for t in "${targets[@]}"; do build_one "$t"; done
 
   log "Done. Binaries under: $OUT_DIR"
   find "$OUT_DIR" -type f -name bash -exec ls -lh {} \;
