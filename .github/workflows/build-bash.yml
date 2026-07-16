@@ -101,6 +101,7 @@ jobs:
           fi
           echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
           echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+          echo "slug=$(IFS=-; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
           echo "Selected ABIs: ${selected[*]}"
 
       - name: Validate inputs
@@ -162,7 +163,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_ROOT }}/prefix-*
-          key: bash-deps-rl${{ inputs.readline_version }}-nc${{ inputs.ncurses_version }}-api${{ inputs.api }}-${{ steps.abis.outputs.csv }}
+          key: bash-deps-rl${{ inputs.readline_version }}-nc${{ inputs.ncurses_version }}-api${{ inputs.api }}-${{ steps.abis.outputs.slug }}
 
       - name: Verify NDK
         run: |
