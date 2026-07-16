@@ -64,7 +64,7 @@ adb shell 'export TERM=xterm-256color; /data/local/tmp/bash -i'
 |------|------|------|
 | `BASH_VER` | `5.3` | GNU bash |
 | `NCURSES_VER` | `6.5` | GNU ncurses（wide-char，静态） |
-| `READLINE_VER` | `8.3` | GNU readline（静态） |
+| `READLINE_VER` | `8.3` | GNU readline（静态；**bash 5.3 需要 ≥ 8.3**） |
 | `API` | `24` | min Android API |
 | `BUILD_ROOT` | `/tmp/bash4droid-build` | 源码与 deps 缓存目录 |
 

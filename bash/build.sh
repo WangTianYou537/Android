@@ -7,6 +7,7 @@
 #   ./bash/build.sh arm64 arm
 #   ./bash/build.sh all
 #   API=28 BASH_VER=5.3 ./bash/build.sh arm64
+#   Note: bash 5.3 needs readline >= 8.3 (uses rl_macro_display_hook etc.)
 #
 # Android notes:
 #   - Dynamic PIE (not fully static) — avoids arm64 TLS underalignment abort.
@@ -404,18 +405,34 @@ from pathlib import Path
 import sys
 libs = " ".join(sys.argv[1:])
 p = Path("Makefile")
-text = p.read_text()
-needle = "$(PURIFY) $(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program)"
-if needle not in text:
+lines = p.read_text().splitlines(True)
+out = []
+patched = False
+for line in lines:
+    # bash 5.2: $(PURIFY) $(CC) ... -o $(Program) $(OBJECTS) $(LIBS)
+    # bash 5.3: $(CC) ... -o $(Program) $(OBJECTS) $(LIBS)  (no PURIFY)
+    if (
+        not patched
+        and "$(CC)" in line
+        and "-o $(Program)" in line
+        and "$(OBJECTS)" in line
+        and "$(LIBS)" in line
+        and not line.lstrip().startswith("#")
+    ):
+        if sys.argv[1] not in line:
+            line = line.rstrip("\n") + " " + libs + "\n"
+            print("patched Program link with static readline/ncurses")
+        else:
+            print("Program link already has static archives")
+        print("line:", line.strip()[:160])
+        patched = True
+    out.append(line)
+if not patched:
+    for i, line in enumerate(lines, 1):
+        if "Program" in line and ("$(CC)" in line or "CC)" in line):
+            print(f"candidate L{i}: {line.rstrip()}")
     raise SystemExit("Program link line not found")
-idx = text.find(needle)
-end = text.find("\n", idx)
-if any(a in text[idx:end] for a in sys.argv[1:]):
-    print("Program link already has static archives")
-else:
-    text = text[:end] + " " + libs + text[end:]
-    p.write_text(text)
-    print("patched Program link with static readline/ncurses")
+p.write_text("".join(out))
 PY
 
   python3 - << 'PY'
