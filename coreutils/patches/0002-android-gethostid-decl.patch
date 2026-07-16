@@ -1,0 +1,12 @@
+--- a/src/hostid.c	2024-01-01 21:27:23.000000000 +0800
++++ b/src/hostid.c	2026-07-16 17:34:00.332290078 +0800
+@@ -22,6 +22,9 @@
+ #include <sys/types.h>
+ 
+ #include "system.h"
++
++/* ANDROID_GETHOSTID_DECL: Bionic lacks gethostid declaration/export. */
++long gethostid (void);
+ #include "long-options.h"
+ #include "quote.h"
+ 

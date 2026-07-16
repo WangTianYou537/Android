@@ -1,0 +1,14 @@
+--- a/lib/time.in.h	2024-02-19 21:47:56.000000000 +0800
++++ b/lib/time.in.h	2026-07-16 17:34:00.332290078 +0800
+@@ -478,6 +478,11 @@
+ 
+ /* Represents a time zone.
+    (timezone_t) NULL stands for UTC.  */
++/* ANDROID: Bionic (API < 35) typedefs an incomplete timezone_t without mktime_z.
++   Shadow it with a macro so this gnulib typedef binds to a new name. */
++#if defined __ANDROID__
++# define timezone_t gl_timezone_t
++#endif
+ typedef struct tm_zone *timezone_t;
+ 
+ /* tzalloc (name)

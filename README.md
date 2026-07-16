@@ -8,6 +8,7 @@
 ```
 .
 ├── bash/                      # GNU bash 包（静态 ncurses + readline）
+├── coreutils/                 # 官方 GNU coreutils（single-binary）
 │   ├── build.sh
 │   ├── compat/android_compat.c
 │   ├── out/<abi>/…            # gitignore
@@ -59,9 +60,21 @@ echo $NDK
 | 包 | 说明 | 本地构建 | CI |
 |----|------|----------|-----|
 | [bash](bash/) | GNU bash（动态 PIE + 静态 ncurses/readline） | `./bash/build.sh arm64` | [Build Android bash](.github/workflows/build-bash.yml) |
+| [coreutils](coreutils/) | 官方 GNU coreutils（multicall） | `./coreutils/build.sh arm64` | [Build Android coreutils](.github/workflows/build-coreutils.yml) |
 | [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
 
 ## 快速开始
+
+### coreutils
+
+```bash
+source common/env-ndk.sh
+./coreutils/build.sh arm64
+adb push coreutils/out/arm64-v8a/bin /data/local/tmp/coreutils
+adb shell /data/local/tmp/coreutils/ls --version
+```
+
+源码为 **GNU 官方** tarball（非 Termux）。详见 [coreutils/README.md](coreutils/README.md)。
 
 ### bash
 
