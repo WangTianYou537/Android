@@ -1,0 +1,182 @@
+# Build official git for Android (package: git/)
+name: Build Android git
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_version:
+        description: "git version (official tarball, e.g. 2.49.0)"
+        required: true
+        type: string
+        default: "2.49.0"
+      curl_version:
+        description: "libcurl version (static HTTPS)"
+        required: true
+        type: string
+        default: "8.21.0"
+      openssl_version:
+        description: "OpenSSL version (static)"
+        required: true
+        type: string
+        default: "3.3.3"
+      zlib_version:
+        description: "zlib version (static)"
+        required: true
+        type: string
+        default: "1.3.1"
+      api:
+        description: "Min Android API level"
+        required: true
+        type: string
+        default: "24"
+      abi_arm64:
+        description: "ABI · arm64-v8a"
+        required: true
+        type: boolean
+        default: true
+      abi_arm:
+        description: "ABI · armeabi-v7a"
+        required: true
+        type: boolean
+        default: true
+      abi_x86_64:
+        description: "ABI · x86_64"
+        required: true
+        type: boolean
+        default: true
+      abi_x86:
+        description: "ABI · x86"
+        required: true
+        type: boolean
+        default: true
+      ndk_version:
+        description: "NDK release (r27d)"
+        required: true
+        type: string
+        default: "r27d"
+      create_release:
+        description: "Publish per-binary release assets"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-git-${{ github.ref }}-${{ inputs.git_version }}-${{ inputs.abi_arm64 }}-${{ inputs.abi_arm }}-${{ inputs.abi_x86_64 }}-${{ inputs.abi_x86 }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: git ${{ inputs.git_version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GIT_VER: ${{ inputs.git_version }}
+      CURL_VER: ${{ inputs.curl_version }}
+      OPENSSL_VER: ${{ inputs.openssl_version }}
+      ZLIB_VER: ${{ inputs.zlib_version }}
+      API: ${{ inputs.api }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+      BUILD_ROOT: ${{ github.workspace }}/.build/git
+      NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
+      OUT_DIR: ${{ github.workspace }}/git/out
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve ABIs
+        id: abis
+        run: |
+          set -euo pipefail
+          selected=()
+          [[ "${{ inputs.abi_arm64 }}" == "true" ]] && selected+=(arm64)
+          [[ "${{ inputs.abi_arm }}" == "true" ]] && selected+=(arm)
+          [[ "${{ inputs.abi_x86_64 }}" == "true" ]] && selected+=(x86_64)
+          [[ "${{ inputs.abi_x86 }}" == "true" ]] && selected+=(x86)
+          [[ ${#selected[@]} -gt 0 ]] || { echo "::error::Select an ABI"; exit 1; }
+          echo "list=${selected[*]}" >> "$GITHUB_OUTPUT"
+          echo "csv=$(IFS=,; echo "${selected[*]}")" >> "$GITHUB_OUTPUT"
+      - name: Validate
+        run: |
+          set -euo pipefail
+          test -x git/build.sh || chmod +x git/build.sh
+          test -f git/compat/android_compat.h
+          echo "git=$GIT_VER curl=$CURL_VER openssl=$OPENSSL_VER abis=${{ steps.abis.outputs.csv }}"
+      - name: Host tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential perl wget curl file binutils python3
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+      - name: Download NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NDK")"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          wget -q -O "/tmp/${zip}" "https://dl.google.com/android/repository/${zip}"
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+      - name: Build
+        run: |
+          set -euo pipefail
+          chmod +x git/build.sh
+          # shellcheck disable=SC2086
+          ./git/build.sh ${{ steps.abis.outputs.list }}
+      - name: Stage assets
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets dist
+          declare -A MAP=([arm64-v8a]=arm64 [armeabi-v7a]=arm [x86_64]=x86_64 [x86]=x86)
+          found=0
+          asset_list=()
+          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
+            [[ -d "git/out/${dir}/bin" ]] || continue
+            short="${MAP[$dir]}"
+            for bin in git git-remote-http git-remote-https git-daemon git-http-fetch git-http-backend; do
+              src="git/out/${dir}/bin/${bin}"
+              [[ -f "$src" ]] || continue
+              name="${bin}-${GIT_VER}-${short}"
+              cp -a "$src" "release-assets/${name}"
+              chmod 755 "release-assets/${name}"
+              asset_list+=("release-assets/${name}")
+              found=1
+            done
+            [[ -f "git/out/${dir}/BUILD_INFO.txt" ]] && cp -a "git/out/${dir}/BUILD_INFO.txt" "release-assets/BUILD_INFO-${short}.txt"
+          done
+          [[ $found -eq 1 ]] || { echo "::error::no binaries"; exit 1; }
+          {
+            echo "git ${GIT_VER} (official)"
+            echo "libcurl ${CURL_VER} + OpenSSL ${OPENSSL_VER} + zlib ${ZLIB_VER} (static)"
+            echo "ABIs: ${{ steps.abis.outputs.csv }}"
+            echo "API ${API} NDK ${NDK_VERSION}"
+            echo "commit ${{ github.sha }}"
+            for a in "${asset_list[@]}"; do echo "  - $(basename "$a")"; done
+          } | tee dist/RELEASE_NOTES.txt
+          printf '%s\n' "${asset_list[@]}" > dist/asset-files.txt
+          ls -lh release-assets/ | tee dist/SUMMARY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-${{ inputs.git_version }}
+          path: |
+            release-assets/*
+            dist/*
+          retention-days: 30
+      - name: Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="git-${GIT_VER}"
+          TITLE="git ${GIT_VER} (Android)"
+          mapfile -t ASSETS < dist/asset-files.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt --latest=false
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" "$a" --clobber; done
