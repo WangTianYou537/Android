@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build GNU bash for Android (PIE, dynamically linked against Bionic)
+# WITH readline + ncurses support.
+#
 # Usage (from repo root or bash/):
 #   ./bash/build.sh                            # default: arm64 API 24
 #   ./bash/build.sh arm64
@@ -8,7 +10,6 @@
 #   API=28 ./bash/build.sh arm64 arm
 #   BASH_VER=5.2.37 ./bash/build.sh all
 #   NDK=/path/to/ndk ./bash/build.sh arm64
-#
 #
 # Why not fully static?
 #   Static arm64 binaries abort on modern Android Bionic with:
@@ -22,6 +23,10 @@ BUILD_ROOT="${BUILD_ROOT:-/tmp/bash4droid-build}"
 BASH_VER="${BASH_VER:-5.2.37}"
 API="${API:-24}"
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
+
+# Versions of readline & ncurses to cross-compile
+READLINE_VER="${READLINE_VER:-8.2}"
+NCURSES_VER="${NCURSES_VER:-6.4}"
 
 # Package dir = bash/; repo root = parent (for shared NDK / future packages)
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
@@ -64,6 +69,10 @@ export PATH="$TOOLCHAIN/bin:$PATH"
 
 log() { printf '==> %s\n' "$*"; }
 
+# ---------------------------------------------------------------------------
+# Source download helpers
+# ---------------------------------------------------------------------------
+
 ensure_source() {
   mkdir -p "$BUILD_ROOT"
   local tar="bash-${BASH_VER}.tar.gz"
@@ -82,6 +91,53 @@ ensure_source() {
         fi
       done
       [[ $ok -eq 1 ]] || { echo "Failed to download bash source"; exit 1; }
+    fi
+    log "Extracting $tar"
+    tar -xf "$BUILD_ROOT/$tar" -C "$BUILD_ROOT"
+  fi
+}
+
+ensure_ncurses() {
+  local tar="ncurses-${NCURSES_VER}.tar.gz"
+  if [[ ! -d "$BUILD_ROOT/ncurses-${NCURSES_VER}" ]]; then
+    if [[ ! -f "$BUILD_ROOT/$tar" ]]; then
+      log "Downloading ncurses ${NCURSES_VER}..."
+      local urls=(
+        "https://mirrors.kernel.org/gnu/ncurses/$tar"
+        "https://ftp.gnu.org/gnu/ncurses/$tar"
+        "https://invisible-mirror.net/archives/ncurses/$tar"
+      )
+      local ok=0
+      for u in "${urls[@]}"; do
+        if wget -q -O "$BUILD_ROOT/$tar" "$u" || curl -fsSL -o "$BUILD_ROOT/$tar" "$u"; then
+          ok=1
+          break
+        fi
+      done
+      [[ $ok -eq 1 ]] || { echo "Failed to download ncurses source"; exit 1; }
+    fi
+    log "Extracting $tar"
+    tar -xf "$BUILD_ROOT/$tar" -C "$BUILD_ROOT"
+  fi
+}
+
+ensure_readline() {
+  local tar="readline-${READLINE_VER}.tar.gz"
+  if [[ ! -d "$BUILD_ROOT/readline-${READLINE_VER}" ]]; then
+    if [[ ! -f "$BUILD_ROOT/$tar" ]]; then
+      log "Downloading readline ${READLINE_VER}..."
+      local urls=(
+        "https://mirrors.kernel.org/gnu/readline/$tar"
+        "https://ftp.gnu.org/gnu/readline/$tar"
+      )
+      local ok=0
+      for u in "${urls[@]}"; do
+        if wget -q -O "$BUILD_ROOT/$tar" "$u" || curl -fsSL -o "$BUILD_ROOT/$tar" "$u"; then
+          ok=1
+          break
+        fi
+      done
+      [[ $ok -eq 1 ]] || { echo "Failed to download readline source"; exit 1; }
     fi
     log "Extracting $tar"
     tar -xf "$BUILD_ROOT/$tar" -C "$BUILD_ROOT"
@@ -115,6 +171,10 @@ EOF
   fi
 }
 
+# ---------------------------------------------------------------------------
+# ABI resolution
+# ---------------------------------------------------------------------------
+
 resolve_abi() {
   case "$1" in
     arm64|aarch64|arm64-v8a)
@@ -146,6 +206,131 @@ resolve_abi() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Cross-compile ncurses for one ABI
+# ---------------------------------------------------------------------------
+
+build_ncurses() {
+  local ncurses_build="$BUILD_ROOT/ncurses-build-$ABI"
+  local ncurses_prefix="$BUILD_ROOT/prefix-$ABI"
+
+  if [[ -f "$ncurses_prefix/lib/libncursesw.a" ]]; then
+    log "ncurses already built for $ABI, skipping"
+    return
+  fi
+
+  log "Building ncurses ${NCURSES_VER} for $ABI"
+  rm -rf "$ncurses_build"
+  mkdir -p "$ncurses_build"
+  cd "$ncurses_build"
+
+  export CC="${CLANG_PREFIX}${API}-clang"
+  export CXX="${CLANG_PREFIX}${API}-clang++"
+  export AR=llvm-ar
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID"
+  export LDFLAGS="-pie"
+
+  "$BUILD_ROOT/ncurses-${NCURSES_VER}/configure" \
+    --host="${TRIPLE}" \
+    --build="$(uname -m)-pc-linux-gnu" \
+    --prefix="$ncurses_prefix" \
+    --with-shared \
+    --with-normal \
+    --with-termlib \
+    --enable-widec \
+    --enable-pc-files \
+    --disable-database \
+    --disable-home-terminfo \
+    --with-fallbacks="xterm,xterm-256color,linux,vt100,screen,screen-256color,tmux,tmux-256color" \
+    --without-debug \
+    --without-tests \
+    --without-progs \
+    --without-cxx-binding \
+    --without-ada \
+    --without-manpages \
+    --without-cxx \
+    --enable-overwrite \
+    >configure.log 2>&1 || {
+      echo "ERROR: ncurses configure failed. See $ncurses_build/configure.log"
+      tail -30 configure.log
+      exit 1
+    }
+
+  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)" >make.log 2>&1 || {
+    echo "ERROR: ncurses make failed. See $ncurses_build/make.log"
+    grep -iE 'error:|undefined' make.log | tail -20
+    exit 1
+  }
+
+  make install >install.log 2>&1 || {
+    echo "ERROR: ncurses make install failed. See $ncurses_build/install.log"
+    exit 1
+  }
+
+  log "ncurses OK -> $ncurses_prefix"
+}
+
+# ---------------------------------------------------------------------------
+# Cross-compile readline for one ABI (static lib, linked into bash)
+# ---------------------------------------------------------------------------
+
+build_readline() {
+  local rl_build="$BUILD_ROOT/readline-build-$ABI"
+  local ncurses_prefix="$BUILD_ROOT/prefix-$ABI"
+  local rl_prefix="$BUILD_ROOT/prefix-$ABI"
+
+  if [[ -f "$rl_prefix/lib/libreadline.a" ]]; then
+    log "readline already built for $ABI, skipping"
+    return
+  fi
+
+  log "Building readline ${READLINE_VER} for $ABI"
+  rm -rf "$rl_build"
+  mkdir -p "$rl_build"
+  cd "$rl_build"
+
+  export CC="${CLANG_PREFIX}${API}-clang"
+  export CXX="${CLANG_PREFIX}${API}-clang++"
+  export AR=llvm-ar
+  export RANLIB=llvm-ranlib
+  export STRIP=llvm-strip
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
+  export LDFLAGS="-L${ncurses_prefix}/lib"
+  export CPPFLAGS="-I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
+
+  "$BUILD_ROOT/readline-${READLINE_VER}/configure" \
+    --host="${TRIPLE}" \
+    --build="$(uname -m)-pc-linux-gnu" \
+    --prefix="$rl_prefix" \
+    --enable-static \
+    --disable-shared \
+    --with-curses \
+    >configure.log 2>&1 || {
+      echo "ERROR: readline configure failed. See $rl_build/configure.log"
+      tail -30 configure.log
+      exit 1
+    }
+
+  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)" >make.log 2>&1 || {
+    echo "ERROR: readline make failed. See $rl_build/make.log"
+    grep -iE 'error:|undefined' make.log | tail -20
+    exit 1
+  }
+
+  make install >install.log 2>&1 || {
+    echo "ERROR: readline make install failed. See $rl_build/install.log"
+    exit 1
+  }
+
+  log "readline OK -> $rl_prefix"
+}
+
+# ---------------------------------------------------------------------------
+# Build bash for one ABI
+# ---------------------------------------------------------------------------
+
 build_one() {
   local name="$1"
   resolve_abi "$name"
@@ -153,8 +338,13 @@ build_one() {
   local build_dir="$BUILD_ROOT/bash-build-$ABI"
   local dest="$OUT_DIR/$ABI"
   local cc="${CLANG_PREFIX}${API}-clang"
+  local prefix_dir="$BUILD_ROOT/prefix-$ABI"
 
-  log "Building bash ${BASH_VER} for $ABI (API $API) [dynamic PIE]"
+  # 1. Build ncurses & readline for this ABI (idempotent)
+  build_ncurses
+  build_readline
+
+  log "Building bash ${BASH_VER} for $ABI (API $API) [dynamic PIE, readline=yes]"
   log "NDK: $NDK"
   log "CC : $cc"
 
@@ -168,11 +358,13 @@ build_one() {
   export RANLIB=llvm-ranlib
   export STRIP=llvm-strip
   # Dynamic PIE against Bionic — avoids arm64 static TLS underalignment abort.
-  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig"
-  export LDFLAGS="-pie"
-  unset LIBS
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
+  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
+  export LDFLAGS="-pie -L${prefix_dir}/lib"
+  export LIBS="-lreadline -lncursesw -ltinfow"
+  export PKG_CONFIG_PATH="${prefix_dir}/lib/pkgconfig"
 
-  # Cross-compile aarch64 mblen shim (do NOT put it in LIBS — that breaks host tools)
+  # Cross-compile aarch64 mblen shim
   "$CC" $CFLAGS -c "$ROOT/compat/android_compat.c" -o android_compat.o
 
   "$BUILD_ROOT/bash-${BASH_VER}/configure" \
@@ -184,7 +376,8 @@ build_one() {
     --disable-rpath \
     --enable-job-control \
     --enable-history \
-    --disable-readline \
+    --enable-readline \
+    --with-installed-readline="${prefix_dir}" \
     --disable-net-redirections \
     bash_cv_dev_fd=present \
     bash_cv_dev_stdin=present \
@@ -243,6 +436,11 @@ PY
   llvm-strip -s -o "$dest/bash" bash
   chmod 755 "$dest/bash"
 
+  # Copy terminfo database for on-device use
+  if [[ -d "$prefix_dir/share/terminfo" ]]; then
+    cp -a "$prefix_dir/share/terminfo" "$dest/terminfo"
+  fi
+
   {
     echo "bash ${BASH_VER}"
     echo "ABI: $ABI"
@@ -250,7 +448,8 @@ PY
     echo "NDK: $(grep Pkg.Revision "$NDK/source.properties" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
     echo "link: dynamic PIE (bionic)"
     echo "static: no"
-    echo "readline: no"
+    echo "readline: yes (${READLINE_VER})"
+    echo "ncurses: yes (${NCURSES_VER}, wide-char)"
     echo "compat: mblen via android_compat.o"
     file "$dest/bash"
     ls -lh "$dest/bash"
@@ -263,7 +462,10 @@ PY
   log "OK -> $dest/bash"
 }
 
+# ---------------------------------------------------------------------------
 # Expand "all" / dedupe while preserving order
+# ---------------------------------------------------------------------------
+
 expand_targets() {
   local -a raw=("$@")
   local -a out=()
@@ -290,8 +492,14 @@ expand_targets() {
   printf '%s\n' "${uniq[@]}"
 }
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 main() {
   ensure_source
+  ensure_ncurses
+  ensure_readline
   ensure_compat
 
   local -a targets
