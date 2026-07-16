@@ -17,8 +17,9 @@
 #   Link dynamically against Bionic instead (only needs system libc/libdl).
 #
 # Notes:
-#   - getgrent/getpwent family is forced off for API < 26 (Bionic).
-#     Only group/username DB completion is lost; path/cmd Tab still works.
+#   getgrent/getpwent family is forced off (Bionic headers only declare them
+#   for API >= 26). Only group/username DB completion is lost; path/cmd Tab
+#   completion is unaffected.
 
 set -euo pipefail
 
@@ -211,6 +212,44 @@ resolve_abi() {
 }
 
 # ---------------------------------------------------------------------------
+# Android: disable passwd/group iteration (needs API 26+)
+# Critical: must #undef at END of config.h so it wins over earlier #define.
+# CFLAGS -U is NOT enough — config.h re-#defines after command-line -U.
+# ---------------------------------------------------------------------------
+
+android_disable_grent_pwent() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || { echo "ERROR: $cfg missing after configure"; exit 1; }
+
+  # Drop any previous injection (reconfigure / retry safe)
+  if grep -q 'ANDROID_DISABLE_GRENT_PWENT' "$cfg"; then
+    # delete from marker to EOF
+    sed -i '/ANDROID_DISABLE_GRENT_PWENT/,$d' "$cfg"
+  fi
+
+  cat >> "$cfg" << 'EOF'
+
+/* ANDROID_DISABLE_GRENT_PWENT
+ * Bionic only declares getgrent/getpwent family for API >= 26.
+ * Configure link-tests may still set HAVE_*=1; force them off so
+ * bashline.c group/user DB completion is not compiled.
+ * Path / command / variable Tab completion is unaffected.
+ */
+#undef HAVE_GETGRENT
+#undef HAVE_SETGRENT
+#undef HAVE_ENDGRENT
+#undef HAVE_GETPWENT
+#undef HAVE_SETPWENT
+#undef HAVE_ENDPWENT
+#undef HAVE_GETGRENT_R
+#undef HAVE_GETPWENT_R
+EOF
+
+  log "config.h: forced #undef of getgrent/getpwent family"
+  grep -nE 'HAVE_(GET|SET|END)(GR|PW)ENT' "$cfg" | tail -20 || true
+}
+
+# ---------------------------------------------------------------------------
 # Cross-compile ncurses for one ABI
 # ---------------------------------------------------------------------------
 
@@ -235,6 +274,7 @@ build_ncurses() {
   export STRIP=llvm-strip
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID"
   export LDFLAGS="-pie"
+  unset LIBS CPPFLAGS PKG_CONFIG_PATH || true
 
   "$BUILD_ROOT/ncurses-${NCURSES_VER}/configure" \
     --host="${TRIPLE}" \
@@ -303,6 +343,7 @@ build_readline() {
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID -I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
   export LDFLAGS="-L${ncurses_prefix}/lib"
   export CPPFLAGS="-I${ncurses_prefix}/include -I${ncurses_prefix}/include/ncursesw"
+  unset LIBS PKG_CONFIG_PATH || true
 
   "$BUILD_ROOT/readline-${READLINE_VER}/configure" \
     --host="${TRIPLE}" \
@@ -362,19 +403,23 @@ build_one() {
   export RANLIB=llvm-ranlib
   export STRIP=llvm-strip
   # Dynamic PIE against Bionic — avoids arm64 static TLS underalignment abort.
-  # Force-off getgrent/getpwent macros as a belt-and-suspenders for API < 26.
-  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -UHAVE_GETGRENT -UHAVE_GETPWENT -UHAVE_SETGRENT -UHAVE_ENDGRENT -UHAVE_SETPWENT -UHAVE_ENDPWENT"
-  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -UHAVE_GETGRENT -UHAVE_GETPWENT -UHAVE_SETGRENT -UHAVE_ENDGRENT -UHAVE_SETPWENT -UHAVE_ENDPWENT"
+  export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
+  export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw"
   export LDFLAGS="-pie -L${prefix_dir}/lib"
   export LIBS="-lreadline -lncursesw -ltinfow"
   export PKG_CONFIG_PATH="${prefix_dir}/lib/pkgconfig"
 
-  # Cross-compile aarch64 mblen shim
+  # Also pre-seed autoconf cache (belt); real fix is config.h #undef below.
+  export ac_cv_func_getgrent=no
+  export ac_cv_func_setgrent=no
+  export ac_cv_func_endgrent=no
+  export ac_cv_func_getpwent=no
+  export ac_cv_func_setpwent=no
+  export ac_cv_func_endpwent=no
+
+  # Cross-compile mblen shim
   "$CC" $CFLAGS -c "$ROOT/compat/android_compat.c" -o android_compat.o
 
-  # getgrent/getpwent: Bionic only exposes proper headers from API 26+.
-  # Force no so bashline group/user DB completion is not compiled in.
-  # Path / command / variable Tab completion is unaffected.
   "$BUILD_ROOT/bash-${BASH_VER}/configure" \
     --host="${TRIPLE}" \
     --build="$(uname -m)-pc-linux-gnu" \
@@ -413,6 +458,9 @@ build_one() {
       exit 1
     }
 
+  # **** 真正生效的修复：config.h 末尾强制 #undef ****
+  android_disable_grent_pwent "$build_dir/config.h"
+
   # -rdynamic is useless on Android; drop it
   sed -i 's/^LOCAL_LDFLAGS = -rdynamic/LOCAL_LDFLAGS = /' Makefile
 
@@ -425,7 +473,6 @@ t = p.read_text()
 m = re.search(r'^OBJECTS\s*=\s*', t, re.M)
 if not m:
     raise SystemExit("OBJECTS line not found in Makefile")
-# already injected?
 line_end = t.find("\n", m.start())
 line = t[m.start():line_end]
 if "android_compat.o" not in line:
@@ -436,7 +483,9 @@ PY
 
   make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)" >make.log 2>&1 || {
     echo "ERROR: make failed. See $build_dir/make.log"
-    grep -iE 'error:|undefined symbol' make.log | tail -30
+    grep -iE 'error:|undefined symbol' make.log | tail -40
+    echo "---- config.h (grent/pwent) ----"
+    grep -nE 'HAVE_(GET|SET|END)(GR|PW)ENT|ANDROID_DISABLE' config.h | tail -30 || true
     exit 1
   }
 
@@ -469,7 +518,7 @@ PY
     echo "readline: yes (${READLINE_VER})"
     echo "ncurses: yes (${NCURSES_VER}, wide-char)"
     echo "compat: mblen via android_compat.o"
-    echo "getgrent/getpwent: disabled (Android API < 26 safe)"
+    echo "getgrent/getpwent: disabled (config.h #undef, Android API < 26 safe)"
     file "$dest/bash"
     ls -lh "$dest/bash"
     echo "--- needed libs ---"
@@ -528,6 +577,7 @@ main() {
   fi
 
   log "Targets: ${targets[*]}"
+  log "bash=${BASH_VER} readline=${READLINE_VER} ncurses=${NCURSES_VER} api=${API}"
   local t
   for t in "${targets[@]}"; do
     build_one "$t"

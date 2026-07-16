@@ -11,17 +11,17 @@ on:
         description: "GNU bash version (e.g. 5.2.37, 5.3)"
         required: true
         type: string
-        default: "5.2.37"
+        default: "5.3"
       readline_version:
-        description: "Readline version (e.g. 8.2)"
+        description: "Readline version (e.g. 8.2, 8.3)"
         required: true
         type: string
-        default: "8.2"
+        default: "8.3"
       ncurses_version:
-        description: "Ncurses version (e.g. 6.4)"
+        description: "Ncurses version (e.g. 6.4, 6.5)"
         required: true
         type: string
-        default: "6.4"
+        default: "6.5"
       api:
         description: "Min Android API level"
         required: true
@@ -77,7 +77,6 @@ jobs:
       NCURSES_VER: ${{ inputs.ncurses_version }}
       API: ${{ inputs.api }}
       NDK_VERSION: ${{ inputs.ndk_version }}
-      # Shared build cache root; per-package outputs under packages' own out/
       BUILD_ROOT: ${{ github.workspace }}/.build/bash
       NDK: ${{ github.workspace }}/.ndk/android-ndk-${{ inputs.ndk_version }}
       OUT_DIR: ${{ github.workspace }}/bash/out
@@ -127,14 +126,19 @@ jobs:
             echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
             exit 1
           fi
-          test -x bash/build.sh
+          test -x bash/build.sh || chmod +x bash/build.sh
           test -f bash/compat/android_compat.c
+          # Sanity: build.sh must contain the Android getgrent fix
+          if ! grep -q 'ANDROID_DISABLE_GRENT_PWENT' bash/build.sh; then
+            echo "::error::bash/build.sh is missing ANDROID_DISABLE_GRENT_PWENT fix — update build.sh first."
+            exit 1
+          fi
           echo "bash=$BASH_VER readline=$READLINE_VER ncurses=$NCURSES_VER api=$API ndk=$NDK_VERSION abis=${{ steps.abis.outputs.csv }}"
 
       - name: Install host tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bison wget curl file binutils pkg-config
+          sudo apt-get install -y -qq build-essential bison wget curl file binutils pkg-config python3
 
       - name: Cache Android NDK
         id: cache-ndk
@@ -163,7 +167,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUILD_ROOT }}/prefix-*
-          key: bash-deps-rl${{ inputs.readline_version }}-nc${{ inputs.ncurses_version }}-api${{ inputs.api }}-${{ steps.abis.outputs.slug }}
+          key: bash-deps-rl${{ inputs.readline_version }}-nc${{ inputs.ncurses_version }}-api${{ inputs.api }}-ndk${{ inputs.ndk_version }}-${{ steps.abis.outputs.slug }}
 
       - name: Verify NDK
         run: |
@@ -173,12 +177,35 @@ jobs:
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -2
           ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E "aarch64-linux-android${API}-clang$" | head -3
 
+      - name: Clean stale bash build dirs
+        run: |
+          set -euo pipefail
+          # Never reuse old config.h / object files across workflow runs
+          rm -rf "${BUILD_ROOT}/bash-build-"*
+          mkdir -p "$BUILD_ROOT" "$OUT_DIR"
+          echo "BUILD_ROOT=$BUILD_ROOT"
+          ls -la "$BUILD_ROOT" || true
+
       - name: Build bash (with readline)
         run: |
           set -euo pipefail
           chmod +x bash/build.sh
           # shellcheck disable=SC2086
           ./bash/build.sh ${{ steps.abis.outputs.list }}
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          set +e
+          echo "==== bash build dirs ===="
+          find "$BUILD_ROOT" -maxdepth 2 -type d -name 'bash-build-*' 2>/dev/null
+          for d in "$BUILD_ROOT"/bash-build-*; do
+            [[ -d "$d" ]] || continue
+            echo "==== $d/make.log (errors) ===="
+            grep -iE 'error:|undefined symbol' "$d/make.log" 2>/dev/null | tail -40
+            echo "==== $d/config.h (grent/pwent) ===="
+            grep -nE 'HAVE_(GET|SET|END)(GR|PW)ENT|ANDROID_DISABLE' "$d/config.h" 2>/dev/null | tail -40
+          done
 
       - name: Stage per-ABI binaries
         id: pack
@@ -206,7 +233,6 @@ jobs:
             if [[ -f "bash/out/${dir}/BUILD_INFO.txt" ]]; then
               cp -a "bash/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
             fi
-            # Pack terminfo if present
             if [[ -d "bash/out/${dir}/terminfo" ]]; then
               tar -cf "release-assets/${name}.terminfo.tar" -C "bash/out/${dir}" terminfo
               echo "  terminfo: release-assets/${name}.terminfo.tar"
@@ -231,6 +257,7 @@ jobs:
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
             echo "package: bash/"
+            echo "getgrent/getpwent: disabled (Android API < 26)"
             echo "assets:"
             for a in "${asset_list[@]}"; do
               echo "  - $(basename "$a")"
@@ -244,7 +271,6 @@ jobs:
             for a in "${asset_list[@]}"; do
               echo "$a"
             done
-            # Include terminfo tarballs in release uploads
             for f in release-assets/*.terminfo.tar; do
               [[ -f "$f" ]] && echo "$f"
             done
