@@ -1,4 +1,5 @@
 # Build GNU bash for Android (package: bash/)
+# With readline + ncurses support.
 # Actions → "Build Android bash" → Run workflow
 # Release assets: one bare binary per ABI named bash-<version>-<abi> (no zip).
 name: Build Android bash
@@ -11,6 +12,16 @@ on:
         required: true
         type: string
         default: "5.2.37"
+      readline_version:
+        description: "Readline version (e.g. 8.2)"
+        required: true
+        type: string
+        default: "8.2"
+      ncurses_version:
+        description: "Ncurses version (e.g. 6.4)"
+        required: true
+        type: string
+        default: "6.4"
       api:
         description: "Min Android API level"
         required: true
@@ -56,12 +67,14 @@ concurrency:
 
 jobs:
   build:
-    name: bash ${{ inputs.bash_version }}
+    name: bash ${{ inputs.bash_version }} (readline ${{ inputs.readline_version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       BASH_VER: ${{ inputs.bash_version }}
+      READLINE_VER: ${{ inputs.readline_version }}
+      NCURSES_VER: ${{ inputs.ncurses_version }}
       API: ${{ inputs.api }}
       NDK_VERSION: ${{ inputs.ndk_version }}
       # Shared build cache root; per-package outputs under packages' own out/
@@ -97,6 +110,14 @@ jobs:
             echo "::error::bash_version must look like 5.2.37 or 5.3 (got: $BASH_VER)"
             exit 1
           fi
+          if [[ ! "$READLINE_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::readline_version must look like 8.2 (got: $READLINE_VER)"
+            exit 1
+          fi
+          if [[ ! "$NCURSES_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::ncurses_version must look like 6.4 (got: $NCURSES_VER)"
+            exit 1
+          fi
           if [[ ! "$API" =~ ^[0-9]+$ ]] || (( API < 21 || API > 35 )); then
             echo "::error::api must be an integer 21–35 (got: $API)"
             exit 1
@@ -107,12 +128,12 @@ jobs:
           fi
           test -x bash/build.sh
           test -f bash/compat/android_compat.c
-          echo "bash=$BASH_VER api=$API ndk=$NDK_VERSION abis=${{ steps.abis.outputs.csv }}"
+          echo "bash=$BASH_VER readline=$READLINE_VER ncurses=$NCURSES_VER api=$API ndk=$NDK_VERSION abis=${{ steps.abis.outputs.csv }}"
 
       - name: Install host tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bison wget curl file binutils
+          sudo apt-get install -y -qq build-essential bison wget curl file binutils pkg-config
 
       - name: Cache Android NDK
         id: cache-ndk
@@ -136,6 +157,13 @@ jobs:
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           cat "$NDK/source.properties"
 
+      - name: Cache ncurses + readline (per ABI)
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_ROOT }}/prefix-*
+          key: bash-deps-rl${{ inputs.readline_version }}-nc${{ inputs.ncurses_version }}-api${{ inputs.api }}-${{ steps.abis.outputs.csv }}
+
       - name: Verify NDK
         run: |
           set -euo pipefail
@@ -144,7 +172,7 @@ jobs:
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -2
           ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E "aarch64-linux-android${API}-clang$" | head -3
 
-      - name: Build bash
+      - name: Build bash (with readline)
         run: |
           set -euo pipefail
           chmod +x bash/build.sh
@@ -177,6 +205,11 @@ jobs:
             if [[ -f "bash/out/${dir}/BUILD_INFO.txt" ]]; then
               cp -a "bash/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
             fi
+            # Pack terminfo if present
+            if [[ -d "bash/out/${dir}/terminfo" ]]; then
+              tar -cf "release-assets/${name}.terminfo.tar" -C "bash/out/${dir}" terminfo
+              echo "  terminfo: release-assets/${name}.terminfo.tar"
+            fi
             file "$dest" | tee -a dist/SUMMARY.txt
             ls -lh "$dest" | tee -a dist/SUMMARY.txt
             asset_list+=("$dest")
@@ -191,6 +224,8 @@ jobs:
 
           {
             echo "bash ${BASH_VER}"
+            echo "readline: ${READLINE_VER}"
+            echo "ncurses: ${NCURSES_VER} (wide-char)"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
@@ -208,6 +243,10 @@ jobs:
             for a in "${asset_list[@]}"; do
               echo "$a"
             done
+            # Include terminfo tarballs in release uploads
+            for f in release-assets/*.terminfo.tar; do
+              [[ -f "$f" ]] && echo "$f"
+            done
           } > dist/asset-files.txt
 
           echo "notes_path=dist/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
@@ -217,9 +256,10 @@ jobs:
       - name: Upload workflow artifacts (per-ABI binaries)
         uses: actions/upload-artifact@v4
         with:
-          name: bash-${{ inputs.bash_version }}
+          name: bash-${{ inputs.bash_version }}-readline
           path: |
             release-assets/bash-*
+            release-assets/*.terminfo.tar
             dist/RELEASE_NOTES.txt
             dist/SUMMARY.txt
           if-no-files-found: error
@@ -232,7 +272,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="bash-${BASH_VER}"
-          TITLE="bash ${BASH_VER}"
+          TITLE="bash ${BASH_VER} (readline ${READLINE_VER})"
           NOTES_FILE="dist/RELEASE_NOTES.txt"
           mapfile -t ASSETS < dist/asset-files.txt
 
