@@ -143,6 +143,9 @@ ensure_compat() {
 
 int mblen(const char *s, size_t n);
 
+/* strchrnul exists in Bionic (API >= 24) but some TUs miss the declaration. */
+char *strchrnul(const char *s, int c);
+
 #if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 26)
 
 struct group;
@@ -250,17 +253,27 @@ build_ncurses() {
   "$BUILD_ROOT/ncurses-${NCURSES_VER}/configure" \
     --host="${TRIPLE}" --build="$(uname -m)-pc-linux-gnu" \
     --prefix="$ncurses_prefix" \
-    --with-shared --with-normal --with-termlib --enable-widec --enable-pc-files \
-    --disable-database --disable-home-terminfo \
-    --with-fallbacks="xterm,xterm-256color,linux,vt100,screen,screen-256color,tmux,tmux-256color" \
+    --without-shared --with-normal --with-termlib --enable-widec \
+    --disable-database --disable-home-terminfo --disable-db-install \
+    --with-fallbacks="xterm,xterm-256color,linux,vt100,screen,screen-256color,tmux,tmux-256color,ansi,dumb" \
     --without-debug --without-tests --without-progs --without-cxx-binding \
     --without-ada --without-manpages --without-cxx --enable-overwrite \
+    --disable-rpath \
     >configure.log 2>&1 || { echo "ERROR: ncurses configure"; tail -30 configure.log; exit 1; }
   make -j"$(nproc 2>/dev/null || echo 2)" >make.log 2>&1 || {
     echo "ERROR: ncurses make"; grep -iE 'error:|undefined' make.log | tail -20; exit 1; }
   make install >install.log 2>&1 || { echo "ERROR: ncurses install"; exit 1; }
+  # Convenience names for consumers looking for non-w or plain curses
+  if [[ -f "$ncurses_prefix/lib/libncursesw.a" && ! -e "$ncurses_prefix/lib/libncurses.a" ]]; then
+    ln -sf libncursesw.a "$ncurses_prefix/lib/libncurses.a"
+  fi
+  # widec termlib is usually libtinfow.a; also provide libtinfo.a alias
+  if [[ -f "$ncurses_prefix/lib/libtinfow.a" && ! -e "$ncurses_prefix/lib/libtinfo.a" ]]; then
+    ln -sf libtinfow.a "$ncurses_prefix/lib/libtinfo.a"
+  fi
   log "ncurses OK -> $ncurses_prefix"
 }
+
 
 build_readline() {
   local rl_build="$BUILD_ROOT/readline-build-$ABI"
@@ -317,7 +330,9 @@ build_one() {
   export CFLAGS="-O2 -fPIE -fPIC -DANDROID -fno-addrsig -I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -include ${compat_h}"
   export CPPFLAGS="-I${prefix_dir}/include -I${prefix_dir}/include/ncursesw -include ${compat_h}"
   export LDFLAGS="-pie -L${prefix_dir}/lib"
-  export LIBS="-lreadline -lncursesw -ltinfow"
+  # Do NOT put target static libs into LIBS — bash shares LIBS with host tools
+  # (man2html). Absolute .a archives are injected into the Program link line only.
+  unset LIBS
   export PKG_CONFIG_PATH="${prefix_dir}/lib/pkgconfig"
 
   export ac_cv_func_getgrent=no ac_cv_func_setgrent=no ac_cv_func_endgrent=no
@@ -366,6 +381,42 @@ build_one() {
   android_disable_grent_pwent "$build_dir/config.h"
 
   sed -i 's/^LOCAL_LDFLAGS = -rdynamic/LOCAL_LDFLAGS = /' Makefile
+
+  # Prefer absolute static archives (works regardless of -L order / shared leftovers)
+  _rl_a="${prefix_dir}/lib/libreadline.a"
+  _hist_a="${prefix_dir}/lib/libhistory.a"
+  _nc_a="${prefix_dir}/lib/libncursesw.a"
+  if [[ -f "${prefix_dir}/lib/libtinfow.a" ]]; then
+    _ti_a="${prefix_dir}/lib/libtinfow.a"
+  else
+    _ti_a="${prefix_dir}/lib/libtinfo.a"
+  fi
+  for f in "$_rl_a" "$_hist_a" "$_nc_a" "$_ti_a"; do
+    [[ -f "$f" ]] || { echo "ERROR: missing static lib $f"; ls -la "${prefix_dir}/lib" || true; exit 1; }
+  done
+  # Clear any -lreadline/-lncurses that configure may have put into READLINE_LIB/LIBS
+  sed -i 's|^READLINE_LIB = .*|READLINE_LIB = |' Makefile
+  sed -i 's|^HISTORY_LIB = .*|HISTORY_LIB = |' Makefile
+  sed -i 's|^TERMCAP_LIB = .*|TERMCAP_LIB = |' Makefile
+  sed -i -E 's/ -lreadline//g; s/ -lhistory//g; s/ -lncursesw//g; s/ -lncurses//g; s/ -ltinfow//g; s/ -ltinfo//g' Makefile
+  python3 - "$_rl_a" "$_hist_a" "$_nc_a" "$_ti_a" << 'PY'
+from pathlib import Path
+import sys
+libs = " ".join(sys.argv[1:])
+p = Path("Makefile")
+text = p.read_text()
+needle = "$(PURIFY) $(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program)"
+if needle not in text:
+    raise SystemExit("Program link line not found")
+idx = text.find(needle)
+end = text.find("\n", idx)
+if any(a in text[idx:end] for a in sys.argv[1:]):
+    print("Program link already has static archives")
+else:
+    text = text[:end] + " " + libs + text[end:]
+    p.write_text(text)
+    print("patched Program link with static readline/ncurses")
+PY
 
   python3 - << 'PY'
 from pathlib import Path

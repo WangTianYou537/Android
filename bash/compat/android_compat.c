@@ -1,16 +1,11 @@
-/* Bionic shims for GNU bash on Android. */
 #include <stddef.h>
 #include <wchar.h>
 #include <string.h>
 
-/* ------------------------------------------------------------------ */
-/* mblen: not exported from Android libc.so                           */
-/* ------------------------------------------------------------------ */
-
 int mblen(const char *s, size_t n)
 {
   if (s == NULL)
-    return 0; /* always initial shift state */
+    return 0;
   if (n == 0)
     return -1;
   mbstate_t st;
@@ -20,11 +15,6 @@ int mblen(const char *s, size_t n)
     return -1;
   return (int)r;
 }
-
-/* ------------------------------------------------------------------ */
-/* getgrent / getpwent family (API < 26)                              */
-/* Weak stubs: empty enumeration. Path/cmd Tab completion unaffected. */
-/* ------------------------------------------------------------------ */
 
 #if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 26)
 
@@ -39,4 +29,4 @@ __attribute__((weak)) void setpwent(void) {}
 __attribute__((weak)) void endpwent(void) {}
 __attribute__((weak)) struct passwd *getpwent(void) { return NULL; }
 
-#endif /* __ANDROID_API__ < 26 */
+#endif

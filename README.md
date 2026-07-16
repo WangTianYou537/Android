@@ -7,7 +7,7 @@
 
 ```
 .
-├── bash/                      # GNU bash 包
+├── bash/                      # GNU bash 包（静态 ncurses + readline）
 │   ├── build.sh
 │   ├── compat/android_compat.c
 │   ├── out/<abi>/…            # gitignore
@@ -58,7 +58,7 @@ echo $NDK
 
 | 包 | 说明 | 本地构建 | CI |
 |----|------|----------|-----|
-| [bash](bash/) | GNU bash（动态 PIE） | `./bash/build.sh arm64` | [Build Android bash](.github/workflows/build-bash.yml) |
+| [bash](bash/) | GNU bash（动态 PIE + 静态 ncurses/readline） | `./bash/build.sh arm64` | [Build Android bash](.github/workflows/build-bash.yml) |
 | [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
 
 ## 快速开始

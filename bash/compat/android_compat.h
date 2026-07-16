@@ -4,14 +4,11 @@
 
 #include <stddef.h>
 
-/* mblen is not exported from Android libc.so on some API levels. */
 int mblen(const char *s, size_t n);
 
-/*
- * getgrent/getpwent family: only declared in Bionic headers for API >= 26.
- * bash 5.3 bashline.c may call them even when HAVE_GETGRENT is unset.
- * Provide declarations for the compiler; stubs live in android_compat.c.
- */
+/* strchrnul exists in Bionic (API >= 24) but some TUs miss the declaration. */
+char *strchrnul(const char *s, int c);
+
 #if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 26)
 
 struct group;
@@ -25,6 +22,6 @@ void setpwent(void);
 void endpwent(void);
 struct passwd *getpwent(void);
 
-#endif /* __ANDROID_API__ < 26 */
+#endif
 
-#endif /* BASH_ANDROID_COMPAT_H */
+#endif
