@@ -1,6 +1,6 @@
 # Build official GNU coreutils for Android (package: coreutils/)
 # Actions → "Build Android coreutils" → Run workflow
-# Release assets: one multicall binary per ABI named coreutils-<version>-<abi>
+# Release assets: per-ABI tar.gz packages with all outputs under coreutils/out/<ABI>/
 name: Build Android coreutils
 
 on:
@@ -42,7 +42,7 @@ on:
         type: string
         default: "r27d"
       create_release:
-        description: "Publish each ABI as a separate release asset (coreutils-<version>-<abi>)"
+        description: "Publish per-ABI tar.gz packages (all outputs under out/<ABI>/)"
         required: true
         type: boolean
         default: false
@@ -148,64 +148,31 @@ jobs:
           # shellcheck disable=SC2086
           ./coreutils/build.sh ${{ steps.abis.outputs.list }}
 
-      - name: Stage per-ABI multicall binaries
+      - name: Stage per-ABI tar.gz packages
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p dist release-assets
-          found=0
-          asset_list=()
-          declare -A MAP=(
-            [arm64-v8a]=arm64
-            [armeabi-v7a]=arm
-            [x86_64]=x86_64
-            [x86]=x86
-          )
-          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
-            src="coreutils/out/${dir}/bin/coreutils"
-            [[ -f "$src" ]] || continue
-            short="${MAP[$dir]}"
-            name="coreutils-${COREUTILS_VER}-${short}"
-            dest="release-assets/${name}"
-            cp -a "$src" "$dest"
-            chmod 755 "$dest"
-            if [[ -f "coreutils/out/${dir}/BUILD_INFO.txt" ]]; then
-              cp -a "coreutils/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
-            fi
-            # also pack full bin tree (symlinks) as a separate tar for convenience? user asked no zip for release
-            file "$dest" | tee -a dist/SUMMARY.txt
-            ls -lh "$dest" | tee -a dist/SUMMARY.txt
-            asset_list+=("$dest")
-            found=1
-          done
-          if [[ "$found" -eq 0 ]]; then
-            echo "::error::No coreutils binaries under coreutils/out/"
-            find coreutils/out -type f 2>/dev/null || true
-            exit 1
-          fi
+          source common/package-release.sh
+          package_abi_releases coreutils "${COREUTILS_VER}" coreutils/out
           {
             echo "coreutils ${COREUTILS_VER} (official GNU)"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
-            echo "mode: single-binary=symlinks"
-            echo "source: https://ftp.gnu.org/gnu/coreutils/coreutils-${COREUTILS_VER}.tar.xz"
+            echo "package: one tar.gz per ABI with bin/ multicall + BUILD_INFO.txt"
             echo "assets:"
-            for a in "${asset_list[@]}"; do echo "  - $(basename "$a")"; done
+            while read -r a; do echo "  - $(basename "$a")"; done < dist/asset-files.txt
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "commit: ${{ github.sha }}"
           } | tee dist/RELEASE_NOTES.txt
-          {
-            for a in "${asset_list[@]}"; do echo "$a"; done
-          } > dist/asset-files.txt
-          ls -lh release-assets/
+          cat dist/SUMMARY.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: coreutils-${{ inputs.coreutils_version }}
           path: |
-            release-assets/coreutils-*
+            dist/*.tar.gz
             dist/RELEASE_NOTES.txt
             dist/SUMMARY.txt
           if-no-files-found: error
@@ -219,12 +186,11 @@ jobs:
           set -euo pipefail
           TAG="coreutils-${COREUTILS_VER}"
           TITLE="coreutils ${COREUTILS_VER} (Android, official GNU)"
-          NOTES_FILE="dist/RELEASE_NOTES.txt"
           mapfile -t ASSETS < dist/asset-files.txt
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+            gh release edit "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt
           else
-            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --latest=false
+            gh release create "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt --latest=false
           fi
           for asset in "${ASSETS[@]}"; do
             echo "==> upload $(basename "$asset")"

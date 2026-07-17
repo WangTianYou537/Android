@@ -50,7 +50,7 @@ on:
         type: string
         default: "2"
       create_release:
-        description: "Publish JRE/JDK tar.xz assets to GitHub Release (tag jdk17-<tag>)"
+        description: "Publish per-ABI tar.gz packages (jre/jdk archives + BUILD_INFO)"
         required: true
         type: boolean
         default: false
@@ -183,91 +183,33 @@ jobs:
           # shellcheck disable=SC2086
           ./jdk/jdk17/build.sh ${{ steps.abis.outputs.list }}
 
-      - name: Stage release assets (per-ABI tar.xz)
+      - name: Stage per-ABI tar.gz packages
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p dist release-assets
-          found=0
-          asset_list=()
-
-          declare -A MAP=(
-            [arm64-v8a]=arm64
-            [armeabi-v7a]=arm
-            [x86_64]=x86_64
-            [x86]=x86
-          )
-
-          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
-            base="jdk/jdk17/out/${dir}"
-            [[ -d "$base" ]] || continue
-            short="${MAP[$dir]}"
-            for kind in jre jdk; do
-              # Prefer stable name produced by build.sh; fall back to dated tarball
-              src=""
-              if [[ -f "${base}/${kind}17-${short}.tar.xz" ]]; then
-                src="${base}/${kind}17-${short}.tar.xz"
-              else
-                src=$(ls -1 "${base}/${kind}17-${short}-"*.tar.xz 2>/dev/null | head -1 || true)
-              fi
-              [[ -n "$src" && -f "$src" ]] || continue
-              # Release asset: jre17-arm64.tar.xz / jdk17-arm64.tar.xz
-              name="${kind}17-${short}.tar.xz"
-              dest="release-assets/${name}"
-              cp -a "$src" "$dest"
-              ls -lh "$dest" | tee -a dist/SUMMARY.txt
-              file "$dest" | tee -a dist/SUMMARY.txt || true
-              asset_list+=("$dest")
-              found=1
-            done
-            if [[ -f "${base}/BUILD_INFO.txt" ]]; then
-              cp -a "${base}/BUILD_INFO.txt" "release-assets/BUILD_INFO-${short}.txt"
-            fi
-          done
-
-          if [[ "$found" -eq 0 ]]; then
-            echo "::error::No jre/jdk tar.xz under jdk/jdk17/out/"
-            find jdk/jdk17/out -type f 2>/dev/null | head -50 || true
-            exit 1
-          fi
-
+          source common/package-release.sh
+          # Prefer full ABI directory packaging (jre/jdk tar.xz + BUILD_INFO + any extras)
+          package_abi_releases jdk17 "${JDK_TAG}" jdk/jdk17/out
           {
             echo "OpenJDK ${JDK_TAG} (Android / Bionic, headless)"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
-            echo "JOBS: ${JOBS}"
-            echo "package: jdk/jdk17/"
+            echo "package: one tar.gz per ABI containing all outputs under jdk/jdk17/out/<ABI>/"
+            echo "  (jre*.tar.xz / jdk*.tar.xz, BUILD_INFO.txt, ...)"
             echo "assets:"
-            for a in "${asset_list[@]}"; do
-              echo "  - $(basename "$a")  ($(du -h "$a" | awk '{print $1}'))"
-            done
+            while read -r a; do echo "  - $(basename "$a")"; done < dist/asset-files.txt
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
             echo "commit: ${{ github.sha }}"
-            echo
-            echo "Install on device (example arm64 JRE):"
-            echo "  adb push jre17-arm64.tar.xz /data/local/tmp/"
-            echo "  adb shell 'mkdir -p /data/local/tmp/jre17 && tar -xJf /data/local/tmp/jre17-arm64.tar.xz -C /data/local/tmp/jre17'"
-            echo "  adb shell /data/local/tmp/jre17/bin/java -version"
           } | tee dist/RELEASE_NOTES.txt
-
-          {
-            for a in "${asset_list[@]}"; do
-              echo "$a"
-            done
-          } > dist/asset-files.txt
-
-          echo "notes_path=dist/RELEASE_NOTES.txt" >> "$GITHUB_OUTPUT"
-          echo "asset_count=${#asset_list[@]}" >> "$GITHUB_OUTPUT"
-          ls -lh release-assets/
+          cat dist/SUMMARY.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: jdk17-${{ inputs.jdk_tag }}
           path: |
-            release-assets/*
+            dist/*.tar.gz
             dist/RELEASE_NOTES.txt
             dist/SUMMARY.txt
           if-no-files-found: error
@@ -279,39 +221,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Tag: jdk17-jdk-17.0.10-ga  (keeps OpenJDK tag readable)
           TAG="jdk17-${JDK_TAG}"
-          TITLE="OpenJDK ${JDK_TAG} for Android"
-          NOTES_FILE="dist/RELEASE_NOTES.txt"
+          TITLE="OpenJDK ${JDK_TAG} (Android)"
           mapfile -t ASSETS < dist/asset-files.txt
-
           if [[ ${#ASSETS[@]} -eq 0 ]]; then
-            echo "::error::No release assets staged"
+            echo "::error::No release assets"
             exit 1
           fi
-
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG exists — updating notes and re-uploading assets"
-            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+            gh release edit "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt
           else
-            echo "Creating release $TAG"
-            gh release create "$TAG" \
-              --title "$TITLE" \
-              --notes-file "$NOTES_FILE" \
-              --latest=false
+            gh release create "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt --latest=false
           fi
-
           for asset in "${ASSETS[@]}"; do
-            name="$(basename "$asset")"
-            echo "==> upload $name"
+            echo "==> upload $(basename "$asset")"
             gh release upload "$TAG" "$asset" --clobber
           done
-
-          # Also upload BUILD_INFO files if present
-          for info in release-assets/BUILD_INFO-*.txt; do
-            [[ -f "$info" ]] || continue
-            gh release upload "$TAG" "$info" --clobber || true
-          done
-
-          echo "Release $TAG assets:"
           gh release view "$TAG" --json assets --jq '.assets[].name'

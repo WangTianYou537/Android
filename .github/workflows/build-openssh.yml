@@ -50,7 +50,7 @@ on:
         type: string
         default: "r27d"
       create_release:
-        description: "Publish per-binary release assets"
+        description: "Publish per-ABI tar.gz packages (all outputs under out/<ABI>/)"
         required: true
         type: boolean
         default: false
@@ -119,47 +119,38 @@ jobs:
           chmod +x openssh/build.sh
           # shellcheck disable=SC2086
           ./openssh/build.sh ${{ steps.abis.outputs.list }}
-      - name: Stage assets
+      - name: Stage per-ABI tar.gz packages
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p release-assets dist
-          declare -A MAP=([arm64-v8a]=arm64 [armeabi-v7a]=arm [x86_64]=x86_64 [x86]=x86)
-          found=0
-          asset_list=()
-          for dir in arm64-v8a armeabi-v7a x86_64 x86; do
-            [[ -d "openssh/out/${dir}" ]] || continue
-            short="${MAP[$dir]}"
-            for bin in ssh scp sftp sshd ssh-keygen ssh-add ssh-agent ssh-keyscan sftp-server; do
-              src="openssh/out/${dir}/${bin}"
-              [[ -f "$src" ]] || continue
-              name="${bin}-${OPENSSH_VER}-${short}"
-              cp -a "$src" "release-assets/${name}"
-              chmod 755 "release-assets/${name}"
-              asset_list+=("release-assets/${name}")
-              found=1
-            done
-            [[ -f "openssh/out/${dir}/BUILD_INFO.txt" ]] && cp -a "openssh/out/${dir}/BUILD_INFO.txt" "release-assets/BUILD_INFO-${short}.txt"
-          done
-          [[ $found -eq 1 ]] || { echo "::error::no binaries"; exit 1; }
+          source common/package-release.sh
+          package_abi_releases openssh "${OPENSSH_VER}" openssh/out
           {
             echo "OpenSSH ${OPENSSH_VER}"
-            echo "OpenSSL ${OPENSSL_VER} static / zlib ${ZLIB_VER} static"
+            echo "OpenSSL ${OPENSSL_VER} / zlib ${ZLIB_VER}"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
-            echo "API ${API} NDK ${NDK_VERSION}"
-            echo "commit ${{ github.sha }}"
-            for a in "${asset_list[@]}"; do echo "  - $(basename "$a")"; done
+            echo "min Android API: ${API}"
+            echo "NDK: ${NDK_VERSION}"
+            echo "package: one tar.gz per ABI with all ssh binaries + BUILD_INFO.txt (+ lib/ if dynamic)"
+            echo "assets:"
+            while read -r a; do echo "  - $(basename "$a")"; done < dist/asset-files.txt
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit: ${{ github.sha }}"
           } | tee dist/RELEASE_NOTES.txt
-          printf '%s\n' "${asset_list[@]}" > dist/asset-files.txt
-          ls -lh release-assets/ | tee dist/SUMMARY.txt
-      - uses: actions/upload-artifact@v4
+          cat dist/SUMMARY.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: openssh-${{ inputs.openssh_version }}
           path: |
-            release-assets/*
-            dist/*
+            dist/*.tar.gz
+            dist/RELEASE_NOTES.txt
+            dist/SUMMARY.txt
+          if-no-files-found: error
           retention-days: 30
-      - name: Release
+
+      - name: Create / update GitHub Release
         if: ${{ inputs.create_release }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -173,4 +164,8 @@ jobs:
           else
             gh release create "$TAG" --title "$TITLE" --notes-file dist/RELEASE_NOTES.txt --latest=false
           fi
-          for a in "${ASSETS[@]}"; do gh release upload "$TAG" "$a" --clobber; done
+          for asset in "${ASSETS[@]}"; do
+            echo "==> upload $(basename "$asset")"
+            gh release upload "$TAG" "$asset" --clobber
+          done
+          gh release view "$TAG" --json assets --jq '.assets[].name'

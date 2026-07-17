@@ -72,6 +72,33 @@ echo $NDK
 | [jdk/jdk17](jdk/jdk17/) | OpenJDK 17 headless JRE/JDK | `./jdk/jdk17/build.sh arm64` | [Build Android JDK 17](.github/workflows/build-jdk17.yml) |
 
 
+
+## Release 打包约定
+
+所有 package workflow 的 Release / Artifact 统一为：
+
+```
+<pkg>-<version>-<abi>.tar.gz
+```
+
+包内是该 ABI **实际产出的全部文件**（不再只传裸二进制）。例如：
+
+| 包 | 示例压缩包 | 包内典型内容 |
+|----|------------|--------------|
+| bash | `bash-5.3-arm64.tar.gz` | `bash`, `BUILD_INFO.txt`（+ terminfo/ 若有） |
+| coreutils | `coreutils-9.11-arm64.tar.gz` | `bin/*`（multicall+symlinks）, `BUILD_INFO.txt` |
+| curl | `curl-8.21.0-arm64.tar.gz` | `curl`, `cacert.pem`, `curl.sh`, `BUILD_INFO.txt`（+ `lib/`） |
+| openssh | `openssh-9.9p2-arm64.tar.gz` | `ssh`/`scp`/`sshd`/…, `BUILD_INFO.txt`（+ `lib/`） |
+| git | `git-2.49.0-arm64.tar.gz` | `bin/`, `libexec/`, `BUILD_INFO.txt`（+ `lib/`） |
+| jdk17 | `jdk17-<tag>-arm64.tar.gz` | `out/<ABI>/` 下全部（含 jre/jdk 的 tar.xz 与 BUILD_INFO） |
+
+实现：`common/package-release.sh`。本地也可：
+
+```bash
+source common/package-release.sh
+package_abi_releases bash 5.3 bash/out
+```
+
 ## 动态链接模式（共享 OpenSSL / libcurl）
 
 默认各包仍是 **静态嵌入** 依赖（单文件推送）。若要共享 `.so`、减小体积：
