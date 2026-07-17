@@ -91,6 +91,49 @@ download_tar() {
   return 1
 }
 
+stage_curl_package() {
+  # stage_curl_package <dest-dir>
+  # Copies binary (already there), cacert.pem, optional lib/, writes README + tar.gz parent
+  local dest="$1"
+  mkdir -p "$dest"
+  cp -f "$BUILD_ROOT/cacert.pem" "$dest/cacert.pem"
+  # tiny launcher that points CURL_CA_BUNDLE at package-local cacert
+  cat > "$dest/curl.sh" << 'WRAP'
+#!/system/bin/sh
+# Portable launcher: use cacert.pem next to this script.
+HERE=$(cd "$(dirname "$0")" && pwd)
+export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$HERE/cacert.pem}"
+export SSL_CERT_FILE="${SSL_CERT_FILE:-$HERE/cacert.pem}"
+# dynamic libs next to binary
+if [ -d "$HERE/lib" ]; then
+  export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+exec "$HERE/curl" "$@"
+WRAP
+  # also a bash-friendly name
+  cp -f "$dest/curl.sh" "$dest/run-curl.sh"
+  chmod 755 "$dest/curl.sh" "$dest/run-curl.sh" "$dest/curl" 2>/dev/null || true
+  cat > "$dest/README.txt" << EOF
+Android curl package
+====================
+Files:
+  curl          - the binary
+  cacert.pem    - Mozilla CA root store (required for HTTPS)
+  curl.sh       - launcher that sets CURL_CA_BUNDLE automatically
+  lib/          - shared libs (dynamic builds only)
+
+Usage on device:
+  adb push . /data/local/tmp/curl-root
+  adb shell chmod 755 /data/local/tmp/curl-root/curl /data/local/tmp/curl-root/curl.sh
+  adb shell /data/local/tmp/curl-root/curl.sh -I https://example.com
+
+  # or without launcher:
+  adb shell 'CURL_CA_BUNDLE=/data/local/tmp/curl-root/cacert.pem /data/local/tmp/curl-root/curl -I https://example.com'
+
+Default compiled CA path (if set): /data/local/tmp/curl/cacert.pem
+EOF
+}
+
 ensure_sources() {
   mkdir -p "$BUILD_ROOT"
 
@@ -129,6 +172,16 @@ ensure_sources() {
     log "Extracting $ztar (official zlib)"
     tar -xf "$BUILD_ROOT/$ztar" -C "$BUILD_ROOT"
   fi
+
+  # Mozilla CA bundle (curl.se) — required for HTTPS on Android (no system PEM store)
+  if [[ ! -f "$BUILD_ROOT/cacert.pem" ]]; then
+    download_tar       "https://curl.se/ca/cacert.pem"       "https://curl.se/ca/cacert.pem"       "$BUILD_ROOT/cacert.pem"
+  fi
+  # sanity: PEM header
+  head -1 "$BUILD_ROOT/cacert.pem" | grep -q 'BEGIN CERTIFICATE\|Bundle of CA' ||     grep -q 'BEGIN CERTIFICATE' "$BUILD_ROOT/cacert.pem" || {
+      echo "ERROR: cacert.pem does not look like a PEM bundle"
+      exit 1
+    }
 }
 
 resolve_abi() {
@@ -312,8 +365,9 @@ build_curl() {
     --without-nghttp3 \
     --without-ngtcp2 \
     --without-librtmp \
-    --without-ca-bundle \
+    --with-ca-bundle=/data/local/tmp/curl/cacert.pem \
     --without-ca-path \
+    --with-ca-embed="$BUILD_ROOT/cacert.pem" \
     --with-ca-fallback \
     >configure.log 2>&1 || {
       echo "ERROR: curl configure failed. See $bdir/configure.log"
@@ -349,6 +403,7 @@ build_curl() {
   cp -f "$bin" "$dest/curl.unstripped"
   llvm-strip -s -o "$dest/curl" "$bin"
   chmod 755 "$dest/curl"
+  stage_curl_package "$dest"
 
   {
     echo "curl ${CURL_VER}"
@@ -359,6 +414,7 @@ build_curl() {
     echo "TLS: OpenSSL ${OPENSSL_VER} (static)"
     echo "zlib: ${ZLIB_VER} (static)"
     echo "link: dynamic PIE (bionic) + static ssl/crypto/z"
+    echo "CA: embedded (ca-embed) + cacert.pem (default /data/local/tmp/curl/cacert.pem)"
     echo "features: HTTPS via OpenSSL; HTTP/2 disabled (no nghttp2)"
     file "$dest/curl"
     ls -lh "$dest/curl"
@@ -411,7 +467,7 @@ build_curl_dynamic() {
     --without-libpsl --without-brotli --without-zstd \
     --without-libidn2 --without-libssh2 --without-nghttp2 \
     --without-nghttp3 --without-ngtcp2 --without-librtmp \
-    --without-ca-bundle --without-ca-path --with-ca-fallback \
+    --with-ca-bundle=/data/local/tmp/curl/cacert.pem --without-ca-path --with-ca-embed="$BUILD_ROOT/cacert.pem" --with-ca-fallback \
     >configure.log 2>&1 || {
       echo "ERROR: curl configure (dynamic) failed"; tail -60 configure.log; exit 1
     }
@@ -452,6 +508,7 @@ build_curl_dynamic() {
   source "$REPO_ROOT/common/set-rpath.sh"
   set_rpath '$ORIGIN/lib' "$dest/curl"
   set_rpath '$ORIGIN' "$dest"/lib/libcurl.so* "$dest"/lib/libssl.so* "$dest"/lib/libcrypto.so* 2>/dev/null || true
+  stage_curl_package "$dest"
 
   {
     echo "curl ${CURL_VER}"
@@ -464,6 +521,7 @@ build_curl_dynamic() {
     echo "zlib: ${ZLIB_VER} (shared)"
     echo "libcurl: shared"
     echo "rpath: \$ORIGIN/lib"
+    echo "CA: embedded (ca-embed) + cacert.pem (package-local / CURL_CA_BUNDLE)"
     file "$dest/curl"
     ls -lh "$dest/curl"
     echo "--- needed libs ---"
@@ -474,6 +532,7 @@ build_curl_dynamic() {
 
   log "OK (dynamic) -> $dest/curl"
 }
+
 
 build_one() {
   local name="$1"

@@ -167,8 +167,27 @@ jobs:
             mkdir -p "$stage"/{lib,bin,openssh,git}
             # shared libs once
             cp -a "common/deps/out/${abi}/lib/"*.so* "$stage/lib/" 2>/dev/null || true
-            # curl
-            [[ -f "curl/out/${abi}/curl" ]] && cp -a "curl/out/${abi}/curl" "$stage/bin/curl"
+            # curl package (binary + CA + launcher; libs already in stage/lib)
+            if [[ -f "curl/out/${abi}/curl" ]]; then
+              cp -a "curl/out/${abi}/curl" "$stage/bin/curl"
+              [[ -f "curl/out/${abi}/cacert.pem" ]] && cp -a "curl/out/${abi}/cacert.pem" "$stage/cacert.pem"
+              [[ -f "curl/out/${abi}/curl.sh" ]] && cp -a "curl/out/${abi}/curl.sh" "$stage/bin/curl.sh"
+              if [[ ! -f "$stage/cacert.pem" ]]; then
+                wget -q -O "$stage/cacert.pem" https://curl.se/ca/cacert.pem || true
+              fi
+              if [[ ! -f "$stage/bin/curl.sh" ]]; then
+                cat > "$stage/bin/curl.sh" << 'WRAP'
+            #!/system/bin/sh
+            HERE=$(cd "$(dirname "$0")" && pwd)
+            ROOT=$(cd "$HERE/.." && pwd)
+            export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$ROOT/cacert.pem}"
+            export SSL_CERT_FILE="${SSL_CERT_FILE:-$ROOT/cacert.pem}"
+            export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            exec "$HERE/curl" "$@"
+            WRAP
+                chmod 755 "$stage/bin/curl.sh"
+              fi
+            fi
             # openssh
             for b in ssh scp sftp sshd ssh-keygen ssh-add ssh-agent; do
               [[ -f "openssh/out/${abi}/$b" ]] && cp -a "openssh/out/${abi}/$b" "$stage/openssh/"

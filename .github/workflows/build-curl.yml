@@ -1,6 +1,6 @@
 # Build official curl for Android (package: curl/)
 # Actions → "Build Android curl" → Run workflow
-# Release assets: one bare binary per ABI named curl-<version>-<abi>
+# Release assets: per-ABI tar.gz packages (curl + cacert.pem + lib/ if dynamic)
 name: Build Android curl
 
 on:
@@ -52,7 +52,7 @@ on:
         type: string
         default: "r27d"
       create_release:
-        description: "Publish each ABI as a separate release asset (curl-<version>-<abi>)"
+        description: "Publish per-ABI tar.gz packages (binary + cacert.pem + libs)"
         required: true
         type: boolean
         default: false
@@ -165,11 +165,11 @@ jobs:
           # shellcheck disable=SC2086
           ./curl/build.sh ${{ steps.abis.outputs.list }}
 
-      - name: Stage per-ABI binaries
+      - name: Stage per-ABI tar.gz packages
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p dist release-assets
+          mkdir -p dist
           found=0
           asset_list=()
           declare -A MAP=(
@@ -182,16 +182,35 @@ jobs:
             src="curl/out/${dir}/curl"
             [[ -f "$src" ]] || continue
             short="${MAP[$dir]}"
-            name="curl-${CURL_VER}-${short}"
-            dest="release-assets/${name}"
-            cp -a "$src" "$dest"
-            chmod 755 "$dest"
-            if [[ -f "curl/out/${dir}/BUILD_INFO.txt" ]]; then
-              cp -a "curl/out/${dir}/BUILD_INFO.txt" "release-assets/${name}.BUILD_INFO.txt"
+            pkg="curl-${CURL_VER}-${short}"
+            stage="dist/${pkg}"
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            # full package tree from build output (curl, cacert.pem, curl.sh, lib/, README)
+            cp -a "curl/out/${dir}/." "$stage/"
+            # guarantee CA exists even if older build.sh
+            if [[ ! -f "$stage/cacert.pem" ]]; then
+              wget -q -O "$stage/cacert.pem" https://curl.se/ca/cacert.pem
             fi
-            file "$dest" | tee -a dist/SUMMARY.txt
-            ls -lh "$dest" | tee -a dist/SUMMARY.txt
-            asset_list+=("$dest")
+            if [[ ! -f "$stage/curl.sh" ]]; then
+              cat > "$stage/curl.sh" << 'WRAP'
+          #!/system/bin/sh
+          HERE=$(cd "$(dirname "$0")" && pwd)
+          export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$HERE/cacert.pem}"
+          export SSL_CERT_FILE="${SSL_CERT_FILE:-$HERE/cacert.pem}"
+          [ -d "$HERE/lib" ] && export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/curl" "$@"
+          WRAP
+              chmod 755 "$stage/curl.sh"
+            fi
+            chmod 755 "$stage/curl" "$stage/curl.sh" 2>/dev/null || true
+            # package as tar.gz (not bare binary)
+            tar -C dist -czf "dist/${pkg}.tar.gz" "$pkg"
+            file "$stage/curl" | tee -a dist/SUMMARY.txt
+            ls -lh "dist/${pkg}.tar.gz" | tee -a dist/SUMMARY.txt
+            echo "contents of ${pkg}:" | tee -a dist/SUMMARY.txt
+            find "$stage" -maxdepth 2 -printf '  %p\n' | tee -a dist/SUMMARY.txt
+            asset_list+=("dist/${pkg}.tar.gz")
             found=1
           done
           if [[ "$found" -eq 0 ]]; then
@@ -201,12 +220,15 @@ jobs:
           fi
           {
             echo "curl ${CURL_VER} (official)"
-            echo "OpenSSL ${OPENSSL_VER} (static)"
-            echo "zlib ${ZLIB_VER} (static)"
+            echo "OpenSSL ${OPENSSL_VER} / zlib ${ZLIB_VER}"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "min Android API: ${API}"
             echo "NDK: ${NDK_VERSION}"
+            echo "package: tar.gz per ABI containing:"
+            echo "  curl, cacert.pem (Mozilla CA), curl.sh launcher, lib/ (if dynamic)"
+            echo "HTTPS: use ./curl.sh or set CURL_CA_BUNDLE=./cacert.pem"
             echo "source: https://curl.se/download/curl-${CURL_VER}.tar.xz"
+            echo "CA: https://curl.se/ca/cacert.pem"
             echo "assets:"
             for a in "${asset_list[@]}"; do echo "  - $(basename "$a")"; done
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -215,14 +237,14 @@ jobs:
           {
             for a in "${asset_list[@]}"; do echo "$a"; done
           } > dist/asset-files.txt
-          ls -lh release-assets/
+          ls -lh dist/*.tar.gz
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: curl-${{ inputs.curl_version }}
           path: |
-            release-assets/curl-*
+            dist/*.tar.gz
             dist/RELEASE_NOTES.txt
             dist/SUMMARY.txt
           if-no-files-found: error
@@ -235,7 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="curl-${CURL_VER}"
-          TITLE="curl ${CURL_VER} (Android, OpenSSL static)"
+          TITLE="curl ${CURL_VER} (Android)"
           NOTES_FILE="dist/RELEASE_NOTES.txt"
           mapfile -t ASSETS < dist/asset-files.txt
           if gh release view "$TAG" >/dev/null 2>&1; then
