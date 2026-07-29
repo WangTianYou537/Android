@@ -102,6 +102,25 @@ ensure_sources() {
     fi
     tar -xf "$BUILD_ROOT/$ctar" -C "$BUILD_ROOT"
   fi
+  # Source trees must stay pristine: in-tree Configure/make leftovers (*.o, *.a,
+  # configdata.pm) get copied into the next ABI and cause "incompatible with
+  # elf_x86_64" (aarch64 objects mixed into x86_64 archives).
+  clean_pristine_tree "$BUILD_ROOT/openssl-${OPENSSL_VER}"
+  clean_pristine_tree "$BUILD_ROOT/zlib-${ZLIB_VER}"
+}
+
+# Remove build artifacts from an upstream source tree so cp -a stays clean.
+clean_pristine_tree() {
+  local tree="$1"
+  [[ -d "$tree" ]] || return 0
+  # Only wipe known generated junk; keep sources + tarball-shipped files.
+  find "$tree" \( \
+      -name '*.o' -o -name '*.lo' -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \
+      -o -name '*.dylib' -o -name '*.dll' -o -name '*.d' -o -name '*.d.tmp' \
+      -o -name 'configdata.pm' -o -name 'libcrypto.map' -o -name 'libssl.map' \
+    \) -type f -delete 2>/dev/null || true
+  # OpenSSL / zlib generated Makefiles (tarball has Makefile.in / templates only)
+  rm -f "$tree/Makefile" "$tree/makefile" 2>/dev/null || true
 }
 
 resolve_abi() {
@@ -143,71 +162,77 @@ build_zlib_shared() {
   cd "$bdir"
   set_cross_env
   export CHOST="$TRIPLE"
-  
   # Cross clang often fails zlib's shared-lib probe; force SHAREDLIB* after configure.
+  # zlib's real shared target is $(SHAREDLIBV) e.g. libz.so.1.3.1 — there is no bare libz.so rule.
+  # Makefile has no VER= variable; version comes from zlib.h ZLIB_VERSION.
   ./configure --prefix="$prefix" >configure.log 2>&1 || {
     echo "ERROR: zlib configure"; tail -40 configure.log; exit 1
   }
-
-  python3 - "$prefix" << 'PY'
+  local zver
+  zver="$(sed -n 's/^#define ZLIB_VERSION "\([^"]*\)".*/\1/p' zlib.h | head -1)"
+  [[ -n "$zver" ]] || zver="${ZLIB_VER}"
+  local major="${zver%%.*}"
+  python3 - "$zver" "$major" << 'PYINNER'
 from pathlib import Path
 import re, sys
-prefix = sys.argv[1]
-p = Path("Makefile")
-t = p.read_text()
-
-# 安全提取版本号
-m = re.search(r"^VER\s*=\s*(\S+)", t, re.M)
-ver = m.group(1) if m else "1"
-
-# 兼容等号两边的空格，强制注入共享库变量
-t = re.sub(r"^SHAREDLIB\s*=.*$", "SHAREDLIB = libz.so", t, flags=re.M)
-t = re.sub(r"^SHAREDLIBV\s*=.*$", f"SHAREDLIBV = libz.so.{ver}", t, flags=re.M)
-t = re.sub(r"^SHAREDLIBM\s*=.*$", "SHAREDLIBM = libz.so.1", t, flags=re.M)
-
-# 确保 LDSHARED 包含 -shared 参数
+zver, major = sys.argv[1], sys.argv[2]
+t = Path("Makefile").read_text()
+# Force shared lib names (configure may leave them empty on failed cross probe)
+t = re.sub(r"^SHAREDLIB\s*=.*$", "SHAREDLIB=libz.so", t, count=1, flags=re.M)
+t = re.sub(r"^SHAREDLIBV\s*=.*$", f"SHAREDLIBV=libz.so.{zver}", t, count=1, flags=re.M)
+t = re.sub(r"^SHAREDLIBM\s*=.*$", f"SHAREDLIBM=libz.so.{major}", t, count=1, flags=re.M)
+# Keep static + shared in LIBS so install-libs packs both
+t = re.sub(r"^LIBS\s*=.*$", "LIBS=$(STATICLIB) $(SHAREDLIBV)", t, count=1, flags=re.M)
 lines = []
 for line in t.splitlines(True):
-    if (line.startswith("LDSHARED=") or line.startswith("LDSHARED ")) and "-shared" not in line:
-        parts = line.split("=", 1)
-        if len(parts) == 2:
-            line = f"{parts[0]}= {parts[1].strip()} -shared\n"
+    if re.match(r"^LDSHARED\s*=", line) and "-shared" not in line:
+        line = line.rstrip("\n") + " -shared\n"
+    # Drop test binaries from `all` so we don't need to link host-runnable android tests
+    if re.match(r"^all:\s*", line):
+        line = "all: static shared\n"
+    if re.match(r"^static:\s*", line):
+        line = "static: $(STATICLIB)\n"
+    if re.match(r"^shared:\s*", line):
+        line = "shared: $(SHAREDLIBV)\n"
     lines.append(line)
-
-p.write_text("".join(lines))
-print("zlib Makefile forced shared")
-PY
-
-  # 提取版本号并编译对应的共享库目标
-  ver=$(awk -F= '/^VER *=/{gsub(/ /,"",$2); print $2; exit}' Makefile)
-  make -j"$JOBS" "libz.so.${ver}" >make.log 2>&1 || make -j"$JOBS" libz.so >make.log 2>&1 || {
-    echo "ERROR: zlib shared make"; tail -40 make.log; exit 1
+Path("Makefile").write_text("".join(lines))
+print(f"zlib Makefile forced shared (libz.so.{zver})")
+PYINNER
+  # Build only the libraries — skip example/minigzip (cannot run under cross)
+  make -j"$JOBS" "libz.so.${zver}" libz.a >make.log 2>&1 || {
+    echo "ERROR: zlib shared make"; tail -60 make.log; exit 1
   }
-
-  # 手动安装共享库与头文件
+  # Install libs + headers manually (avoids install-time ldconfig / broken shared probe paths)
   mkdir -p "$prefix/lib" "$prefix/include"
-  cp -a libz.so* "$prefix/lib/" 2>/dev/null || true
-  cp -a zlib.h zconf.h "$prefix/include/" 2>/dev/null || true
-  
-  # 编译并保留静态库供需要的组件使用
-  make libz.a >/dev/null 2>&1 || true
+  cp -a "libz.so.${zver}" "$prefix/lib/"
+  ln -sfn "libz.so.${zver}" "$prefix/lib/libz.so.${major}"
+  ln -sfn "libz.so.${zver}" "$prefix/lib/libz.so"
   [[ -f libz.a ]] && cp -a libz.a "$prefix/lib/"
-  
+  cp -a zlib.h zconf.h "$prefix/include/"
   ls "$prefix"/lib/libz.so* >/dev/null 2>&1 || { echo "ERROR: libz.so not installed"; ls -la; exit 1; }
   touch "$stamp"
   log "zlib shared OK -> $prefix/lib"
-  ls -lh "$prefix"/lib/libz.so*
+  ls -lh "$prefix"/lib/libz.so* "$prefix"/lib/libz.a 2>/dev/null
 }
+
 
 build_openssl_shared() {
   local prefix="$1"
   local stamp="$prefix/.stamp-openssl-${OPENSSL_VER}-shared"
-  if [[ -f "$stamp" && -f "$prefix/lib/libssl.so" ]]; then
+  if [[ -f "$stamp" ]] && { [[ -f "$prefix/lib/libssl.so" ]] || [[ -f "$prefix/lib/libssl.so.3" ]]; }; then
     log "OpenSSL shared ready ($ABI)"; return
   fi
   local bdir="$BUILD_ROOT/openssl-shared-$ABI"
+  # Always extract a fresh tree per ABI — never reuse a previously configured source.
   rm -rf "$bdir"
-  cp -a "$BUILD_ROOT/openssl-${OPENSSL_VER}" "$bdir"
+  local otar="openssl-${OPENSSL_VER}.tar.gz"
+  if [[ -f "$BUILD_ROOT/$otar" ]]; then
+    mkdir -p "$bdir"
+    tar -xf "$BUILD_ROOT/$otar" -C "$bdir" --strip-components=1
+  else
+    cp -a "$BUILD_ROOT/openssl-${OPENSSL_VER}" "$bdir"
+    clean_pristine_tree "$bdir"
+  fi
   cd "$bdir"
   set_cross_env
   # shared is default when not no-shared; keep docs/tests off
@@ -217,8 +242,10 @@ build_openssl_shared() {
     >configure.log 2>&1 || {
       echo "ERROR: OpenSSL Configure"; tail -50 configure.log; exit 1
     }
+  # Force a clean rebuild so leftover objects/archives cannot mix ABIs.
+  make -j"$JOBS" clean >/dev/null 2>&1 || true
   make -j"$JOBS" >make.log 2>&1 || {
-    echo "ERROR: OpenSSL make"; grep -iE 'error:|fatal' make.log | tail -30; exit 1
+    echo "ERROR: OpenSSL make"; grep -iE 'error:|fatal|incompatible' make.log | tail -40; exit 1
   }
   make install_sw >install.log 2>&1
   # normalize lib64 if any
