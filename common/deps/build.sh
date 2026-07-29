@@ -143,51 +143,52 @@ build_zlib_shared() {
   cd "$bdir"
   set_cross_env
   export CHOST="$TRIPLE"
-  # shared build (default for modern zlib when not --static)
-  # Cross clang often fails zlib's shared-lib probe; force SHAREDLIB* after configure.
-  ./configure --prefix="$prefix" >configure.log 2>&1 || {
+
+  # 关键：使用 --shared 强制构建共享库
+  ./configure --prefix="$prefix" --shared >configure.log 2>&1 || {
     echo "ERROR: zlib configure"; tail -40 configure.log; exit 1
   }
+
+  # 仍然保留对 Makefile 的微调，确保 LDSHARED 包含 -shared（以防万一）
   python3 - "$prefix" << 'PY'
 from pathlib import Path
 import re, sys
 prefix = sys.argv[1]
 p = Path("Makefile")
 t = p.read_text()
-t = re.sub(r"^SHAREDLIB=\s*$", "SHAREDLIB=libz.so", t, flags=re.M)
-t = re.sub(r"^SHAREDLIBV=\s*$", "SHAREDLIBV=libz.so.1.3.1", t, flags=re.M)
-t = re.sub(r"^SHAREDLIBM=\s*$", "SHAREDLIBM=libz.so.1", t, flags=re.M)
-# version from env not available — detect from existing Makefile VER=
-import re as _re
-m = _re.search(r"^VER\s*=\s*(\S+)", t, _re.M)
-ver = m.group(1) if m else "1"
-t = _re.sub(r"^SHAREDLIBV=.*$", f"SHAREDLIBV=libz.so.{ver}", t, count=1, flags=_re.M)
-t = _re.sub(r"^SHAREDLIBM=.*$", "SHAREDLIBM=libz.so.1", t, count=1, flags=_re.M)
-t = _re.sub(r"^SHAREDLIB=.*$", "SHAREDLIB=libz.so", t, count=1, flags=_re.M)
-# ensure -shared on LDSHARED
+# 确保 SHAREDLIB 变量已正确定义（--shared 应该已经做了，但保险）
+if not re.search(r'^SHAREDLIB\s*=', t, re.M):
+    t = re.sub(r'^VER\s*=\s*(\S+)', r'VER=\1\nSHAREDLIB=libz.so', t, flags=re.M)
+# 确保 LDSHARED 包含 -shared
 lines = []
 for line in t.splitlines(True):
     if line.startswith("LDSHARED=") and "-shared" not in line:
         line = line.rstrip("\n") + " -shared\n"
     lines.append(line)
 Path("Makefile").write_text("".join(lines))
-print("zlib Makefile forced shared")
+print("zlib Makefile adjusted")
 PY
-  # Build the versioned shared object explicitly (skip broken test programs)
-  make -j"$JOBS" "$prefix/../" 2>/dev/null || true
-  # Prefer versioned target from Makefile
-  ver=$(awk -F= '/^VER *=/{gsub(/ /,"",$2); print $2; exit}' Makefile)
-  make -j"$JOBS" "libz.so.${ver}" >make.log 2>&1 || make -j"$JOBS" libz.so >make.log 2>&1 || {
-    echo "ERROR: zlib shared make"; tail -40 make.log; exit 1
+
+  # 直接构建并安装（make install 会处理 .so 和 .a）
+  make -j"$JOBS" >make.log 2>&1 || {
+    echo "ERROR: zlib make"; tail -40 make.log; exit 1
   }
-  # install .so manually (make install may only install static when SHAREDLIB was empty at configure)
-  mkdir -p "$prefix/lib" "$prefix/include"
-  cp -a libz.so* "$prefix/lib/" 2>/dev/null || true
-  cp -a zlib.h zconf.h "$prefix/include/" 2>/dev/null || true
-  # also keep static for packages that still want it
-  make libz.a >/dev/null 2>&1 || true
-  [[ -f libz.a ]] && cp -a libz.a "$prefix/lib/"
-  ls "$prefix"/lib/libz.so* >/dev/null 2>&1 || { echo "ERROR: libz.so not installed"; ls -la; exit 1; }
+  make install >install.log 2>&1 || {
+    echo "ERROR: zlib install"; tail -40 install.log; exit 1
+  }
+
+  # 如果 install 没有创建符号链接，手动补齐
+  (
+    cd "$prefix/lib"
+    if [[ ! -e libz.so ]]; then
+      so=$(ls libz.so.* 2>/dev/null | head -1 || true)
+      [[ -n "$so" ]] && ln -sfn "$so" libz.so
+    fi
+  )
+
+  ls "$prefix"/lib/libz.so* >/dev/null 2>&1 || {
+    echo "ERROR: libz.so not installed"; ls -la "$prefix/lib"; exit 1
+  }
   touch "$stamp"
   log "zlib shared OK -> $prefix/lib"
   ls -lh "$prefix"/lib/libz.so*
