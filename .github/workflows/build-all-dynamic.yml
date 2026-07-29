@@ -159,80 +159,22 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p dist
-          declare -A MAP=([arm64]=arm64-v8a [arm]=armeabi-v7a [x86_64]=x86_64 [x86]=x86)
-          for short in ${{ steps.abis.outputs.list }}; do
-            abi="${MAP[$short]}"
-            stage="dist/android-dynamic-${short}"
-            mkdir -p "$stage"/{lib,bin,openssh,git}
-            # shared libs once
-            cp -a "common/deps/out/${abi}/lib/"*.so* "$stage/lib/" 2>/dev/null || true
-            # curl package (binary + CA + launcher; libs already in stage/lib)
-            if [[ -f "curl/out/${abi}/curl" ]]; then
-              cp -a "curl/out/${abi}/curl" "$stage/bin/curl"
-              [[ -f "curl/out/${abi}/cacert.pem" ]] && cp -a "curl/out/${abi}/cacert.pem" "$stage/cacert.pem"
-              [[ -f "curl/out/${abi}/curl.sh" ]] && cp -a "curl/out/${abi}/curl.sh" "$stage/bin/curl.sh"
-              if [[ ! -f "$stage/cacert.pem" ]]; then
-                wget -q -O "$stage/cacert.pem" https://curl.se/ca/cacert.pem || true
-              fi
-              if [[ ! -f "$stage/bin/curl.sh" ]]; then
-                cat > "$stage/bin/curl.sh" << 'WRAP'
-            #!/system/bin/sh
-            HERE=$(cd "$(dirname "$0")" && pwd)
-            ROOT=$(cd "$HERE/.." && pwd)
-            export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$ROOT/cacert.pem}"
-            export SSL_CERT_FILE="${SSL_CERT_FILE:-$ROOT/cacert.pem}"
-            export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            exec "$HERE/curl" "$@"
-            WRAP
-                chmod 755 "$stage/bin/curl.sh"
-              fi
-            fi
-            # openssh
-            for b in ssh scp sftp sshd ssh-keygen ssh-add ssh-agent; do
-              [[ -f "openssh/out/${abi}/$b" ]] && cp -a "openssh/out/${abi}/$b" "$stage/openssh/"
-            done
-            # git
-            if [[ -d "git/out/${abi}/bin" ]]; then
-              cp -a "git/out/${abi}/bin/." "$stage/git/"
-            fi
-            # helper run script
-            cat > "$stage/env.sh" << 'ENV'
-          # source this on device, then run binaries
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$HERE/lib:${LD_LIBRARY_PATH:-}"
-          export PATH="$HERE/bin:$HERE/openssh:$HERE/git:$PATH"
-          export GIT_EXEC_PATH="$HERE/git"
-          ENV
-            # Prefer rpath; env.sh is fallback
-            if command -v patchelf >/dev/null; then
-              for f in "$stage"/bin/* "$stage"/openssh/* "$stage"/git/*; do
-                [[ -f "$f" && ! -L "$f" ]] || continue
-                file "$f" | grep -q ELF || continue
-                case "$f" in
-                  */git/*) patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true ;;
-                  *)       patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true ;;
-                esac
-              done
-              for f in "$stage"/lib/*.so*; do
-                [[ -f "$f" && ! -L "$f" ]] || continue
-                patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
-              done
-            fi
-            tar -C dist -czf "dist/android-dynamic-${short}.tar.gz" "android-dynamic-${short}"
-            echo "packed android-dynamic-${short}.tar.gz"
-          done
-          ls -lh dist/*.tar.gz | tee dist/SUMMARY.txt
+          chmod +x common/package-dynamic.sh
+          # shellcheck disable=SC2086
+          ./common/package-dynamic.sh ${{ steps.abis.outputs.list }}
           {
             echo "Android dynamic bundle"
             echo "ABIs: ${{ steps.abis.outputs.csv }}"
             echo "API ${API}"
             echo "OpenSSL ${OPENSSL_VER} zlib ${ZLIB_VER} curl ${CURL_VER}"
             echo "OpenSSH ${OPENSSH_VER} git ${GIT_VER}"
-            echo "layout: lib/*.so + bin/curl + openssh/* + git/*"
+            echo "layout: lib/*.so + bin/curl(+curl.sh) + cacert.pem + openssh/* + git/*"
             echo "rpath: binaries use \$ORIGIN/../lib"
             echo "commit ${{ github.sha }}"
+            echo "assets:"
+            while read -r a; do echo "  - $(basename "$a")"; done < dist/asset-files.txt
           } | tee dist/RELEASE_NOTES.txt
+          cat dist/SUMMARY.txt
 
       - uses: actions/upload-artifact@v4
         with:
